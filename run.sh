@@ -35,9 +35,19 @@ fi
 # Termux itself (termux-tools) - no addon app required.
 command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
 
-# Outstanding-members watcher. run.sh cannot observe taps - it only launches a
-# process - so this polls the database instead. Set PENDING_EVERY=0 to disable.
-PENDING_EVERY="${PENDING_EVERY:-300}"
+# Outstanding-members watcher, OFF by default.
+#
+# This is what printed a "pending: N have not accepted" block into the terminal
+# every five minutes. It is off now for two reasons, not just the noise:
+#
+#   * The query below has no chat_id filter, so it pools every chat the bot has
+#     ever seen into one count, and it counts admins and members who have since
+#     left - which is what its own "unverified" caveat is admitting to.
+#   * /pending answers the same question on demand and checks each member
+#     against Telegram first, so the number it gives is a real one.
+#
+# Set PENDING_EVERY=300 in gate-bot.env if you ever want the poller back.
+PENDING_EVERY="${PENDING_EVERY:-0}"
 
 watch_pending() {
     while true; do

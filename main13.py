@@ -204,8 +204,9 @@ def bi(en, zh, sep="\n"):
 
 # Everything at INFO and above goes to LOG_FILE. Only WARNING and above reaches
 # the terminal, so a Termux session stays readable while the file keeps the full
-# httpx/unlock trail you need when diagnosing a stuck member. Tracebacks are
-# logged at ERROR, so they still print.
+# unlock trail you need when diagnosing a stuck member. Tracebacks are logged at
+# ERROR, so they still print. The per-request httpx lines are deliberately NOT
+# part of that trail - see the httpx filter below the handler setup.
 LOG_FILE = os.environ.get("LOG_FILE", os.path.expanduser("~/bot.log"))
 LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
 LOG_BACKUPS = int(os.environ.get("LOG_BACKUPS", "3"))
@@ -231,6 +232,15 @@ _sh = logging.StreamHandler(sys.stdout)
 _sh.setLevel(logging.WARNING)
 _sh.setFormatter(_fmt)
 _root.addHandler(_sh)
+
+# httpx logs one line per HTTP request at INFO, and the URL in that line carries
+# the bot token: https://api.telegram.org/bot<TOKEN>/getUpdates. Long polling
+# therefore wrote the token into LOG_FILE every few seconds - thousands of copies
+# a day, churning the rotation until the events worth reading had aged out of it,
+# and making the log itself something that cannot be shared for debugging.
+# WARNING keeps genuine transport failures without either problem.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("tc-gate-bot")
 if _LOG_FILE_STATUS.startswith("UNAVAILABLE"):
