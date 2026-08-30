@@ -300,6 +300,7 @@ def db():
             chat_id INTEGER,
             user_id INTEGER,
             requested_at TEXT,
+            alerted_at TEXT DEFAULT '',
             PRIMARY KEY (chat_id, user_id)
         )"""
     )
@@ -322,6 +323,14 @@ def db():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(acceptances)").fetchall()}
     if "terms_version" not in cols:
         conn.execute("ALTER TABLE acceptances ADD COLUMN terms_version TEXT DEFAULT ''")
+
+    # Migrate DBs created before duplicate-alert suppression. Existing rows get
+    # '' - treated as "never alerted" - so anything still pending when this
+    # lands is alerted once more and then settles. Re-alerting a genuinely open
+    # request is the harmless direction; going silent on one is not.
+    pend_cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_requests)").fetchall()}
+    if "alerted_at" not in pend_cols:
+        conn.execute("ALTER TABLE pending_requests ADD COLUMN alerted_at TEXT DEFAULT ''")
 
     # A one-shot import of the FULL member list from snapshot_members.py (a
     # separate Telethon script - Bot API has no "list members" call, so this
@@ -489,11 +498,48 @@ def build_message_link(chat, message_id):
 
 
 def record_pending_request(chat_id, user_id):
+    """Record (or refresh) a pending join request.
+
+    Returns True when this request still needs an admin alert: either we have
+    never seen it before, or every previous attempt to deliver the alert failed
+    and is worth retrying.
+
+    Telegram redelivers any update it never got a confirmation for, and this
+    process is killed and restarted by Android as a matter of routine - so the
+    same join request arrives again on the next boot. The old INSERT OR REPLACE
+    said nothing about whether anyone had been told, so every restart posted a
+    fresh copy of the alert into the admin group, each with its own live Claim
+    and Approve buttons. A member who withdraws a request and sends another one
+    took the same path.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT alerted_at FROM pending_requests WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO pending_requests "
+                "(chat_id, user_id, requested_at, alerted_at) VALUES (?,?,?,'')",
+                (chat_id, user_id, now),
+            )
+            return True
+        # Already on file. Keep alerted_at; only freshen when it was last seen.
+        conn.execute(
+            "UPDATE pending_requests SET requested_at=? WHERE chat_id=? AND user_id=?",
+            (now, chat_id, user_id),
+        )
+    return not (row[0] or "")
+
+
+def mark_request_alerted(chat_id, user_id):
+    """Called only once an alert has actually reached somebody, so a delivery
+    that failed everywhere is retried rather than counted as done."""
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO pending_requests (chat_id, user_id, requested_at) "
-            "VALUES (?,?,?)",
-            (chat_id, user_id, datetime.now(timezone.utc).isoformat()),
+            "UPDATE pending_requests SET alerted_at=? WHERE chat_id=? AND user_id=?",
+            (datetime.now(timezone.utc).isoformat(), chat_id, user_id),
         )
 
 
@@ -787,6 +833,24 @@ def pending_join_claims(source_chat_id):
 # open default. This is the same design Shieldy, Rose and AutomuterBot use.
 
 # Chat default while the gate is up: ordinary member rights.
+#
+# can_invite_users is False on purpose, and it is the one field here worth
+# understanding before changing.
+#
+# The group runs with "Approve New Members" on, so every entrant is supposed to
+# arrive as a join request an admin reviews by hand. The invite right is the one
+# member permission that can route somebody past that review. While the group was
+# open-join it cost nothing to grant - anyone could join unaided anyway - so it
+# was set True and stayed True after approval was turned on, which quietly left
+# every accepted member able to walk a guest in around the door.
+#
+# Note this is the ONLY place the fix belongs. LIFT_PERMISSIONS below must keep
+# every field True: the Bot API reads an all-True restrict call as "delete this
+# user's exception", which drops them back to plain member status governed by the
+# chat default set here. Setting can_invite_users=False there instead would leave
+# each unlocked member sitting in `restricted` status carrying a permanent
+# exception - it would still deny the invite right, but by the wrong mechanism.
+# Fix the default; let the lift keep meaning "lift".
 OPEN_PERMISSIONS = ChatPermissions(
     can_send_messages=True,
     can_send_audios=True,
@@ -798,7 +862,7 @@ OPEN_PERMISSIONS = ChatPermissions(
     can_send_polls=True,
     can_send_other_messages=True,
     can_add_web_page_previews=True,
-    can_invite_users=True,
+    can_invite_users=False,
     can_change_info=False,
     can_pin_messages=False,
     can_manage_topics=False,
@@ -1758,14 +1822,22 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_reply(update, context, err)
         return
     chat = type("T", (), {"id": target})()
+    # OPEN_PERMISSIONS, not FULL_PERMISSIONS. Disabling the T&C gate should not
+    # also hand every member the invite right back and reopen a way around
+    # "Approve New Members" - those are two separate decisions, and this command
+    # is only being asked to make the first one.
     try:
         await context.bot.set_chat_permissions(
-            chat.id, FULL_PERMISSIONS, use_independent_chat_permissions=INDEPENDENT_PERMS
+            chat.id, OPEN_PERMISSIONS, use_independent_chat_permissions=INDEPENDENT_PERMS
         )
     except TelegramError as e:
         await admin_reply(update, context, f"Could not restore permissions: {e}")
         return
-    await admin_reply(update, context, "Default group permissions restored - gate disabled.")
+    await admin_reply(update, context,
+        "Chat default permissions restored - the gate is disabled for anyone "
+        "joining from now on.\n\nMembers who are currently restricted keep their "
+        "individual restriction: this only changes the chat default. Run /resync "
+        "to lift the ones who had accepted.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2400,11 +2472,19 @@ async def cmd_join_claims(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notify_admin_groups_of_join(bot, source_chat_id, user):
     """Post an alert with Claim + Approve buttons to every registered admin
     group. Under manual-approval mode this is the ONLY way the requester
-    gets into the group - see on_admin_approve."""
-    notify_chats = get_notify_chats(source_chat_id)
-    if not notify_chats:
-        return
+    gets into the group - see on_admin_approve.
 
+    Returns True if the alert reached at least one destination.
+
+    When no admin group is registered, or every registered one fails, this
+    falls back to DMing ADMIN_IDS. It used to return silently in that case,
+    which was survivable when the mute was the real barrier and an unnoticed
+    request still could not talk. Now that approval is the barrier, an alert
+    nobody receives is a person left waiting at the door for as long as it
+    takes someone to think to check - with no warning anywhere that it
+    happened. The fallback has to not depend on one group's chat id still
+    being valid.
+    """
     safe_name = html.escape(user.first_name or str(user.id))
     uname_str = f" (@{html.escape(user.username)})" if user.username else ""
     text = (
@@ -2424,14 +2504,45 @@ async def notify_admin_groups_of_join(bot, source_chat_id, user):
             callback_data=f"{APPROVE_CB}:{source_chat_id}:{user.id}"),
     ]])
 
+    notify_chats = get_notify_chats(source_chat_id)
+    delivered = 0
     for notify_cid in notify_chats:
         try:
             await bot.send_message(
                 notify_cid, text,
                 parse_mode="HTML",
                 reply_markup=keyboard)
+            delivered += 1
         except TelegramError as e:
             log.warning("join notify to chat %s failed: %s", notify_cid, e)
+
+    if delivered:
+        return True
+
+    if notify_chats:
+        reason = (f"None of the {len(notify_chats)} registered admin group(s) "
+                  "could be reached, so this came to you directly.")
+    else:
+        reason = ("No admin group is registered for this chat, so this came to "
+                  "you directly. Run /join_notify in your admin group to have "
+                  "these posted there instead.")
+    log.warning("join alert for user_id=%s falling back to admin DMs: %s",
+                user.id, reason)
+
+    for uid in sorted(ADMIN_IDS):
+        try:
+            await bot.send_message(
+                uid, f"{text}\n\n⚠️ {html.escape(reason)}",
+                parse_mode="HTML",
+                reply_markup=keyboard)
+            delivered += 1
+        except TelegramError as e:
+            log.warning("join alert DM to admin %s failed: %s", uid, e)
+
+    if not delivered:
+        log.error("join alert for user_id=%s in chat %s reached NOBODY - no "
+                  "admin group and no admin DM succeeded", user.id, source_chat_id)
+    return delivered > 0
 
 
 async def on_claim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2684,11 +2795,16 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = req.from_user
     chat = req.chat
     remember_user(chat.id, user)
-    record_pending_request(chat.id, user.id)
+
+    if not record_pending_request(chat.id, user.id):
+        log.info("join request from user_id=%s in chat %s was already alerted - "
+                 "not posting a second copy", user.id, chat.id)
+        return
 
     # No DM to the requester here - that's the point. They stay invisible to
     # the group and uncontactable-by-bot-first-move until an admin approves.
-    await notify_admin_groups_of_join(context.bot, chat.id, user)
+    if await notify_admin_groups_of_join(context.bot, chat.id, user):
+        mark_request_alerted(chat.id, user.id)
 
 
 async def on_admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
