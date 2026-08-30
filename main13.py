@@ -3962,6 +3962,7 @@ async def _process_agree(update, context, query, user, data):
             return
 
         clear_pending_request(chat_id, user.id)
+        clear_join_claim(chat_id, user.id)
         await clear_prompt(context.bot, chat_id, user.id)
         record_acceptance(chat_id, user.id, user.username, user.full_name)
         if auto_approved_now:
@@ -3972,6 +3973,11 @@ async def _process_agree(update, context, query, user, data):
             await finalize_join_alerts(
                 context.bot, chat_id, user.id, user,
                 "✅ <b>Auto-approved</b> — the passphrase matched. No action needed.")
+        # finalize_join_alerts (above, when it ran) needs get_join_alerts() to
+        # still have rows to find and edit - clearing them has to wait until
+        # after it returns, in both branches, or the resolved text never
+        # reaches the alert at all.
+        clear_join_alerts(chat_id, user.id)
         # Tap already acknowledged at the top of on_agree; the DM edit below is
         # the visible confirmation for the join-request flow.
         try:
