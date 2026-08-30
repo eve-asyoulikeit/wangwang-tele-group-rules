@@ -180,8 +180,20 @@ STARTUP_NOTIFY = os.environ.get("STARTUP_NOTIFY", "0").strip() \
 
 # DM the admins when something actually fails. Defaults ON: the whole problem
 # with a phone deployment is that failures land in a log nobody is reading.
+# This also gates the "gate is down" alerts from on_my_chat_member - turning it
+# off silences those too, which is almost certainly not what you want.
 ERROR_NOTIFY = os.environ.get("ERROR_NOTIFY", "1").strip() \
     not in ("0", "false", "no")
+
+# Hours between "still running" DMs to the admins. 0 disables.
+#
+# This is the only way to catch the failures the bot cannot possibly report
+# itself: a revoked token, a killed process, a flat battery, a phone left on
+# aeroplane mode. From the outside every one of those looks identical - silence
+# - and silence is indistinguishable from a quiet week. What you are watching
+# for is the ping that does NOT arrive, so pick an interval you would actually
+# notice a gap in. 24 is a reasonable start.
+HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "0") or 0)
 # Seconds between error DMs. A crash loop must not turn into a DM flood.
 ERROR_NOTIFY_COOLDOWN = int(os.environ.get("ERROR_NOTIFY_COOLDOWN", "300"))
 
@@ -954,7 +966,9 @@ def config_summary():
         f"PROMPT_COOLDOWN:    {PROMPT_COOLDOWN_SECONDS}s",
         f"DELETE_JOIN_MSGS:   {DELETE_JOIN_MESSAGES}",
         f"PROMPT_TTL_SECONDS: {PROMPT_TTL_SECONDS}",
-        f"ERROR_NOTIFY:       {ERROR_NOTIFY} (cooldown {ERROR_NOTIFY_COOLDOWN}s)",
+        f"ERROR_NOTIFY:       {ERROR_NOTIFY} (cooldown {ERROR_NOTIFY_COOLDOWN}s)"
+        + ("  - ALSO SILENCES 'gate is down' alerts" if not ERROR_NOTIFY else ""),
+        f"HEARTBEAT_HOURS:    {HEARTBEAT_HOURS or 'off - nothing will tell you if the bot dies'}",
         f"BILINGUAL:          {BILINGUAL} (EN + Simplified Chinese)"
         + ("  (prompts never deleted)" if not PROMPT_TTL_SECONDS else ""),
         f"BOT_API_BASE:       {BOT_API_BASE or '(unset - talking to real Telegram)'}",
@@ -2729,6 +2743,102 @@ async def on_member_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def describe_own_rights(m):
+    """The bot's own standing in a chat, reduced to what the gate depends on."""
+    admin = m.status == ChatMemberStatus.ADMINISTRATOR
+    return {
+        "status":   m.status,
+        "restrict": admin and bool(getattr(m, "can_restrict_members", False)),
+        "invite":   admin and bool(getattr(m, "can_invite_users", False)),
+        "delete":   admin and bool(getattr(m, "can_delete_messages", False)),
+        "pin":      admin and bool(getattr(m, "can_pin_messages", False)),
+    }
+
+
+def own_rights_delta(was, now):
+    """(lost, blocking, regained) for a change in the bot's own rights.
+
+    blocking means the gate cannot function: approving a join request needs
+    'invite users' and restricting or unmuting anyone needs 'restrict members'.
+    Losing either one stops new members being processed at all; the others
+    degrade the experience without stopping it.
+    """
+    lost = []
+    if now["status"] in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        lost.append("I have been removed from the group entirely")
+    elif now["status"] != ChatMemberStatus.ADMINISTRATOR:
+        lost.append("I am no longer an admin")
+    else:
+        if was["restrict"] and not now["restrict"]:
+            lost.append("'Restrict members' taken away - I cannot gate or unmute anyone")
+        if was["invite"] and not now["invite"]:
+            lost.append("'Invite users' taken away - I cannot approve join requests")
+        if was["delete"] and not now["delete"]:
+            lost.append("'Delete messages' taken away - I cannot clear old prompts")
+        if was["pin"] and not now["pin"]:
+            lost.append("'Pin messages' taken away - I cannot re-pin the rules")
+
+    blocking = (now["status"] != ChatMemberStatus.ADMINISTRATOR
+                or not now["restrict"] or not now["invite"])
+    regained = (now["status"] == ChatMemberStatus.ADMINISTRATOR
+                and now["restrict"] and now["invite"]
+                and not (was["restrict"] and was["invite"]))
+    return lost, blocking, regained
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The bot's OWN membership or rights in a chat changed.
+
+    Nothing was watching this. Only ChatMemberHandler.CHAT_MEMBER was
+    registered, and that reports other people - so an admin demoting the bot, or
+    un-ticking one box in its admin rights, took the gate offline in complete
+    silence. There is no error to catch either: the bot simply stops being able
+    to approve or restrict anyone, and the only symptom is that things quietly
+    fail to happen. On a group that has just tightened its door, that is the
+    outage you can least afford not to hear about.
+
+    Telegram delivers this update even when the bot is removed outright, so the
+    alert still goes out from a chat the bot is no longer in.
+    """
+    cmu = update.my_chat_member
+    if cmu is None:
+        return
+    chat = cmu.chat
+    if chat.type == ChatType.PRIVATE:
+        return  # one user blocking the bot is not a gate outage
+
+    was = describe_own_rights(cmu.old_chat_member)
+    now = describe_own_rights(cmu.new_chat_member)
+    if was == now:
+        return
+
+    title = chat.title or str(chat.id)
+    log.warning("OWN STATUS CHANGED in %r (%s): %s -> %s", title, chat.id, was, now)
+
+    lost, blocking, regained = own_rights_delta(was, now)
+
+    if lost:
+        head = "\U0001F6A8 THE GATE IS DOWN" if blocking else "⚠️ My admin rights changed"
+        tail = ("\n\nUntil this is restored I cannot approve join requests or "
+                "restrict anyone, so new members are not being processed at all. "
+                "Re-grant my admin rights, then run /setup_gate."
+                if blocking else "")
+        await notify_admins(
+            context.bot,
+            f"{head} in {title} ({chat.id}).\n\n"
+            + "\n".join(f"- {item}" for item in lost) + tail,
+            key=f"rights-lost:{chat.id}",
+        )
+    elif regained:
+        await notify_admins(
+            context.bot,
+            f"✅ Admin rights restored in {title} ({chat.id}).\n\n"
+            "Run /setup_gate to re-pin the rules message and confirm the chat "
+            "default permissions are still correct.",
+            key=f"rights-back:{chat.id}",
+        )
+
+
 async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove Telegram's own join/leave notices, which pile up during rollout."""
     if not DELETE_JOIN_MESSAGES:
@@ -3256,6 +3366,32 @@ async def job_verify_nudge(context: ContextTypes.DEFAULT_TYPE):
             log.warning("scheduled verify_nudge report to admin %s failed: %s", uid, e)
 
 
+async def job_heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic proof of life. Deliberately not throttled through
+    notify_admins: the entire value of this message is that it arrives on
+    schedule, so suppressing one would defeat the point."""
+    chats = gate_chats()
+    try:
+        pending = sum(len(pending_join_claims(c)) for c in chats)
+    except sqlite3.Error as e:
+        pending = f"unknown ({e})"
+    text = (
+        "✅ Gate bot still running.\n"
+        f"Started: {runtime_get('last_start', '?')}\n"
+        f"Restarts: {runtime_get('restart_count', '?')}\n"
+        f"Gated chats: {len(chats)}\n"
+        f"Unclaimed join requests: {pending}\n\n"
+        "If one of these stops arriving, assume the bot is down - a dead "
+        "process, a revoked token or a flat battery all look the same from "
+        "your side."
+    )
+    for uid in sorted(ADMIN_IDS):
+        try:
+            await context.bot.send_message(uid, text)
+        except TelegramError as e:
+            log.warning("heartbeat to admin %s failed: %s", uid, e)
+
+
 async def on_startup(app):
     prev, count = record_startup()
     log.info("Startup #%s (previous start: %s)", count, prev)
@@ -3273,7 +3409,17 @@ async def on_startup(app):
             "job_queue is unavailable - the timed /verify_nudge schedule was NOT "
             'registered. Install the extra: pip install "python-telegram-bot[job-queue]"'
             " and restart.")
+        if HEARTBEAT_HOURS > 0:
+            log.warning("HEARTBEAT_HOURS=%s but job_queue is unavailable, so no "
+                        "heartbeat will be sent. Install the job-queue extra.",
+                        HEARTBEAT_HOURS)
     else:
+        if HEARTBEAT_HOURS > 0:
+            every = HEARTBEAT_HOURS * 3600
+            app.job_queue.run_repeating(job_heartbeat, interval=every, first=every,
+                                        name="heartbeat")
+            log.info("Heartbeat every %s hour(s) to %s admin(s)",
+                     HEARTBEAT_HOURS, len(ADMIN_IDS))
         chats = gate_chats()
         if len(chats) == 1:
             chat_id = chats[0]
@@ -3341,6 +3487,7 @@ def main():
     app.add_handler(CommandHandler("join_notify", cmd_join_notify))
     app.add_handler(CommandHandler("join_claims", cmd_join_claims))
     app.add_handler(ChatMemberHandler(on_member_joined, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & (filters.StatusUpdate.NEW_CHAT_MEMBERS
