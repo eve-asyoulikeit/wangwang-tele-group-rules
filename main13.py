@@ -40,6 +40,7 @@ import html
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import sys
@@ -194,6 +195,50 @@ ERROR_NOTIFY = os.environ.get("ERROR_NOTIFY", "1").strip() \
 # for is the ping that does NOT arrive, so pick an interval you would actually
 # notice a gap in. 24 is a reasonable start.
 HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "0") or 0)
+
+# ---------------------------------------------------------------------------
+# Join screening
+# ---------------------------------------------------------------------------
+# When on, the bot DMs every new join requester immediately - permitted since
+# Bot API 5.5 for anyone who has sent a join request to a chat the bot
+# administers with can_invite_users, even though they have never messaged it -
+# links them the rules, and asks how they found the group and why they want to
+# join. Their answers are attached to the admin alert, so the screening DM an
+# admin used to send by hand is already answered by the time anyone looks.
+#
+# Off by default. Turning it on changes what every new member sees.
+SCREENING_ENABLED = os.environ.get("SCREENING_ENABLED", "0").strip() \
+    not in ("0", "false", "no", "")
+
+# Let a clean answer approve itself, with no admin in the loop.
+#
+# OFF by default, and worth thinking about before turning on. A human deciding
+# who gets in is currently your entire perimeter; this replaces that human with
+# a substring match, and substring matches leak - one member telling a friend
+# "just say you found us on Instagram" is the whole attack. Note also that the
+# guards below can only measure the SHAPE of an answer, never its truth.
+#
+# Screening is worth running with this off: what it buys either way is that the
+# admin's decision arrives pre-answered instead of costing a DM conversation,
+# which was always most of the work.
+SCREENING_AUTO_APPROVE = os.environ.get("SCREENING_AUTO_APPROVE", "0").strip() \
+    not in ("0", "false", "no", "")
+
+# Case-insensitive, matched as plain substrings - which is deliberate, since
+# Chinese does not separate words and a token-based match would never fire on
+# it. Tune these to your group; the defaults are a starting point, not a
+# vetting policy.
+SCREENING_KEYWORDS = [k.strip().lower() for k in os.environ.get(
+    "SCREENING_KEYWORDS",
+    "animal,abuse,rescue,welfare,dog,cat,stray,volunteer,adopt,advocacy,"
+    "wangwang,wang wang,friend,instagram,facebook,tiktok,news,"
+    "动物,虐待,救助,福利,流浪,"
+    "义工,领养,朋友,新闻"
+).split(",") if k.strip()]
+
+# Answers shorter than this are treated as non-answers. Without it, "yes"
+# clears the bar that asking two open questions exists to set.
+SCREENING_MIN_CHARS = int(os.environ.get("SCREENING_MIN_CHARS", "25"))
 # Seconds between error DMs. A crash loop must not turn into a DM flood.
 ERROR_NOTIFY_COOLDOWN = int(os.environ.get("ERROR_NOTIFY_COOLDOWN", "300"))
 
@@ -313,7 +358,32 @@ def db():
             user_id INTEGER,
             requested_at TEXT,
             alerted_at TEXT DEFAULT '',
+            user_chat_id INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
+        )"""
+    )
+    # Answers to the screening questions, and where the requester's DM lives.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS screening (
+            chat_id INTEGER,
+            user_id INTEGER,
+            state TEXT,
+            answer TEXT DEFAULT '',
+            answered_at TEXT DEFAULT '',
+            flags TEXT DEFAULT '',
+            PRIMARY KEY (chat_id, user_id)
+        )"""
+    )
+    # Where each admin alert was posted, so it can be edited in place when the
+    # requester answers rather than posting a second message about the same
+    # person into the same chat.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS join_alerts (
+            chat_id INTEGER,
+            user_id INTEGER,
+            notify_chat_id INTEGER,
+            message_id INTEGER,
+            PRIMARY KEY (chat_id, user_id, notify_chat_id)
         )"""
     )
     # Telegram's Bot API cannot resolve a @username to a user id. The only way
@@ -343,6 +413,12 @@ def db():
     pend_cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_requests)").fetchall()}
     if "alerted_at" not in pend_cols:
         conn.execute("ALTER TABLE pending_requests ADD COLUMN alerted_at TEXT DEFAULT ''")
+    # Telegram does not promise from_user.id equals the id of the private chat
+    # with that user, and says to use user_chat_id from the join request to
+    # reach them. 0 means "we never captured one" - callers fall back to the
+    # user id, which is what the bot did everywhere before this existed.
+    if "user_chat_id" not in pend_cols:
+        conn.execute("ALTER TABLE pending_requests ADD COLUMN user_chat_id INTEGER DEFAULT 0")
 
     # A one-shot import of the FULL member list from snapshot_members.py (a
     # separate Telethon script - Bot API has no "list members" call, so this
@@ -509,7 +585,7 @@ def build_message_link(chat, message_id):
     return None
 
 
-def record_pending_request(chat_id, user_id):
+def record_pending_request(chat_id, user_id, user_chat_id=None):
     """Record (or refresh) a pending join request.
 
     Returns True when this request still needs an admin alert: either we have
@@ -533,8 +609,9 @@ def record_pending_request(chat_id, user_id):
         if row is None:
             conn.execute(
                 "INSERT INTO pending_requests "
-                "(chat_id, user_id, requested_at, alerted_at) VALUES (?,?,?,'')",
-                (chat_id, user_id, now),
+                "(chat_id, user_id, requested_at, alerted_at, user_chat_id) "
+                "VALUES (?,?,?,'',?)",
+                (chat_id, user_id, now, int(user_chat_id or 0)),
             )
             return True
         # Already on file. Keep alerted_at; only freshen when it was last seen.
@@ -542,7 +619,29 @@ def record_pending_request(chat_id, user_id):
             "UPDATE pending_requests SET requested_at=? WHERE chat_id=? AND user_id=?",
             (now, chat_id, user_id),
         )
+        if user_chat_id:
+            conn.execute(
+                "UPDATE pending_requests SET user_chat_id=? WHERE chat_id=? AND user_id=?",
+                (int(user_chat_id), chat_id, user_id),
+            )
     return not (row[0] or "")
+
+
+def dm_target(chat_id, user_id):
+    """Where to DM this requester.
+
+    Prefers the user_chat_id Telegram supplied with the join request: the Bot
+    API docs are explicit that from_user.id is not guaranteed to equal the id of
+    the private chat with that user, and that user_chat_id is what you should
+    reply to. Falls back to the user id for anyone recorded before that was
+    captured, which is what every call site did previously.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT user_chat_id FROM pending_requests WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ).fetchone()
+    return (row[0] if row and row[0] else None) or user_id
 
 
 def mark_request_alerted(chat_id, user_id):
@@ -816,6 +915,133 @@ def pending_join_claims(source_chat_id):
 
 
 # ---------------------------------------------------------------------------
+# Join screening storage & scoring
+# ---------------------------------------------------------------------------
+_LINKISH = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/|@[A-Za-z0-9_]{5,})", re.I)
+
+# CJK, plus Tamil, which the rules page is also published in.
+_DENSE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
+_TAMIL = re.compile(r"[஀-௿]")
+
+
+def answer_weight(text: str) -> int:
+    """Length of an answer in rough information units rather than characters.
+
+    A flat character count is the wrong measure for a bilingual group. Chinese
+    packs two to three times the meaning into a character - 「朋友介绍的，我想帮助
+    流浪动物」 is a complete answer in under twenty - so a threshold tuned for
+    English silently sets a far higher bar for Chinese, and the people it would
+    turn away are precisely the members this group is written for. Weighting the
+    dense scripts keeps one threshold honest across all of them.
+    """
+    body = text or ""
+    return (len(body)
+            + int(len(_DENSE.findall(body)) * 1.5)
+            + int(len(_TAMIL.findall(body)) * 0.5))
+
+
+def set_screening(chat_id, user_id, state, answer=None, flags=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO screening (chat_id, user_id, state, answer, answered_at, flags) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET state=excluded.state",
+            (chat_id, user_id, state, answer or "", now if answer else "",
+             ",".join(flags or [])),
+        )
+        if answer is not None:
+            conn.execute(
+                "UPDATE screening SET answer=?, answered_at=?, flags=? "
+                "WHERE chat_id=? AND user_id=?",
+                (answer, now, ",".join(flags or []), chat_id, user_id),
+            )
+
+
+def get_screening(chat_id, user_id):
+    """(state, answer, flags) or (None, '', []) if this person has no row."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT state, answer, flags FROM screening WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ).fetchone()
+    if not row:
+        return None, "", []
+    return row[0], row[1] or "", [f for f in (row[2] or "").split(",") if f]
+
+
+def awaiting_answer(user_id):
+    """The chat this person still owes a screening answer for, newest first.
+
+    Keyed on user only: their reply arrives in a DM, which carries no clue about
+    which group it is about.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT chat_id FROM screening WHERE user_id=? AND state='asked' "
+            "ORDER BY rowid DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def score_answer(text: str):
+    """Red flags on a screening answer. Empty list means nothing looked wrong.
+
+    These test the SHAPE of an answer, never its truth - a fluent lie passes
+    every one of them. That is the ceiling on what any automated screen can do
+    here, and the reason auto-approval is opt-in.
+    """
+    flags = []
+    body = (text or "").strip()
+    if not body:
+        flags.append("no-answer")
+        return flags
+    if answer_weight(body) < SCREENING_MIN_CHARS:
+        flags.append("too-short")
+    if _LINKISH.search(body):
+        flags.append("contains-link")
+    low = body.lower()
+    if SCREENING_KEYWORDS and not any(k in low for k in SCREENING_KEYWORDS):
+        flags.append("no-keyword")
+    return flags
+
+
+def screening_verdict(chat_id, user_id):
+    """('auto'|'review', flags). 'auto' only ever with SCREENING_AUTO_APPROVE
+    on AND a completely clean answer - any single flag sends it to a human."""
+    state, answer, flags = get_screening(chat_id, user_id)
+    if state is None:
+        return "review", ["not-screened"]
+    if state == "asked":
+        return "review", ["no-answer"]
+    if not SCREENING_AUTO_APPROVE:
+        return "review", flags
+    return ("auto", flags) if not flags else ("review", flags)
+
+
+def record_join_alert(chat_id, user_id, notify_chat_id, message_id):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO join_alerts "
+            "(chat_id, user_id, notify_chat_id, message_id) VALUES (?,?,?,?)",
+            (chat_id, user_id, notify_chat_id, message_id))
+
+
+def get_join_alerts(chat_id, user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT notify_chat_id, message_id FROM join_alerts "
+            "WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchall()
+
+
+def clear_join_alerts(chat_id, user_id):
+    with db() as conn:
+        conn.execute("DELETE FROM join_alerts WHERE chat_id=? AND user_id=?",
+                     (chat_id, user_id))
+
+
+# ---------------------------------------------------------------------------
 # Permission sets
 # ---------------------------------------------------------------------------
 # NOTE: the last three MUST stay False. See the module docstring - passing True
@@ -969,6 +1195,13 @@ def config_summary():
         f"ERROR_NOTIFY:       {ERROR_NOTIFY} (cooldown {ERROR_NOTIFY_COOLDOWN}s)"
         + ("  - ALSO SILENCES 'gate is down' alerts" if not ERROR_NOTIFY else ""),
         f"HEARTBEAT_HOURS:    {HEARTBEAT_HOURS or 'off - nothing will tell you if the bot dies'}",
+        f"SCREENING_ENABLED:  {SCREENING_ENABLED}",
+        f"SCREENING_AUTO_APPROVE: {SCREENING_AUTO_APPROVE}"
+        + ("  <- a substring match, not a human, decides who gets in"
+           if (SCREENING_ENABLED and SCREENING_AUTO_APPROVE) else ""),
+        f"SCREENING_KEYWORDS: {len(SCREENING_KEYWORDS)} term(s)"
+        + ("  (ignored, screening is off)" if not SCREENING_ENABLED else ""),
+        f"SCREENING_MIN_CHARS:{SCREENING_MIN_CHARS}",
         f"BILINGUAL:          {BILINGUAL} (EN + Simplified Chinese)"
         + ("  (prompts never deleted)" if not PROMPT_TTL_SECONDS else ""),
         f"BOT_API_BASE:       {BOT_API_BASE or '(unset - talking to real Telegram)'}",
@@ -1013,6 +1246,18 @@ def config_summary():
                     "the same terms - make sure they agree, or drop one.")
     if BOT_API_BASE:
         warn.append("BOT_API_BASE is set - SIMULATION MODE, not talking to Telegram.")
+    if SCREENING_ENABLED and SCREENING_AUTO_APPROVE:
+        warn.append(
+            "SCREENING_AUTO_APPROVE is ON. A clean answer now admits somebody "
+            "with no admin involved, so a substring match is doing the job "
+            "manual approval was turned on to give a person. Keywords leak - "
+            "one member telling a friend what to write is enough.")
+    if SCREENING_ENABLED and not RULES_CHANNEL_URL:
+        warn.append("Screening is on but RULES_CHANNEL_URL is unset, so the "
+                    "screening DM asks people to accept rules it cannot link.")
+    if SCREENING_ENABLED and not SCREENING_KEYWORDS:
+        warn.append("SCREENING_KEYWORDS is empty, so the no-keyword check never "
+                    "fires and every answered request looks clean.")
     if warn:
         lines.append("")
         lines += ["WARNINGS:"] + [f"  ! {w}" for w in warn]
@@ -2509,7 +2754,49 @@ async def cmd_join_claims(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await admin_reply_long(update, context, "\n".join(lines))
 
 
-async def notify_admin_groups_of_join(bot, source_chat_id, user):
+def join_alert_keyboard(source_chat_id, user_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🙋 Claim", callback_data=f"{CLAIM_CB}:{source_chat_id}:{user_id}"),
+        InlineKeyboardButton(
+            "✅ Approve", callback_data=f"{APPROVE_CB}:{source_chat_id}:{user_id}"),
+    ]])
+
+
+def build_join_alert_text(user, req=None):
+    """The alert body. Rebuilt verbatim when the message is edited to append a
+    screening answer, so it has to depend only on the user (and, at post time,
+    the request), never on anything that has moved on since.
+
+    bio and invite_link come free with every join request and were being thrown
+    away. The bio is often the quickest read on a spam account, and the invite
+    link tells you which of your links they came through - worth having a named
+    link per channel so that answer is useful.
+    """
+    safe_name = html.escape(user.first_name or str(user.id))
+    uname_str = f" (@{html.escape(user.username)})" if user.username else ""
+    lines = [
+        "📥 <b>New join request</b>\n",
+        f'<a href="tg://user?id={user.id}">{safe_name}</a>{uname_str}',
+        f"User ID: <code>{user.id}</code>",
+    ]
+    if req is not None:
+        bio = getattr(req, "bio", None)
+        if bio:
+            lines.append(f"Bio: <i>{html.escape(bio[:200])}</i>")
+        link = getattr(req, "invite_link", None)
+        if link is not None:
+            label = getattr(link, "name", None) or getattr(link, "invite_link", "")
+            if label:
+                lines.append(f"Via link: <code>{html.escape(str(label))}</code>")
+    lines.append(
+        "\nThey cannot see the group yet. <b>Claim</b> to say you are handling "
+        "them; <b>Approve</b> once satisfied."
+    )
+    return "\n".join(lines)
+
+
+async def notify_admin_groups_of_join(bot, source_chat_id, user, req=None):
     """Post an alert with Claim + Approve buttons to every registered admin
     group. Under manual-approval mode this is the ONLY way the requester
     gets into the group - see on_admin_approve.
@@ -2525,34 +2812,20 @@ async def notify_admin_groups_of_join(bot, source_chat_id, user):
     happened. The fallback has to not depend on one group's chat id still
     being valid.
     """
-    safe_name = html.escape(user.first_name or str(user.id))
-    uname_str = f" (@{html.escape(user.username)})" if user.username else ""
-    text = (
-        f"📥 <b>New join request</b>\n\n"
-        f"<a href=\"tg://user?id={user.id}\">{safe_name}</a>{uname_str}\n"
-        f"User ID: <code>{user.id}</code>\n\n"
-        "This person cannot see the group and has not been contacted. "
-        "Tap <b>Claim</b> to say you'll reach out and question them; tap "
-        "<b>Approve</b> once satisfied to admit them and send the T&C."
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🙋 Claim",
-            callback_data=f"{CLAIM_CB}:{source_chat_id}:{user.id}"),
-        InlineKeyboardButton(
-            "✅ Approve",
-            callback_data=f"{APPROVE_CB}:{source_chat_id}:{user.id}"),
-    ]])
+    text = build_join_alert_text(user, req)
+    keyboard = join_alert_keyboard(source_chat_id, user.id)
 
     notify_chats = get_notify_chats(source_chat_id)
     delivered = 0
     for notify_cid in notify_chats:
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 notify_cid, text,
                 parse_mode="HTML",
                 reply_markup=keyboard)
             delivered += 1
+            if getattr(sent, "message_id", None) is not None:
+                record_join_alert(source_chat_id, user.id, notify_cid, sent.message_id)
         except TelegramError as e:
             log.warning("join notify to chat %s failed: %s", notify_cid, e)
 
@@ -2571,11 +2844,13 @@ async def notify_admin_groups_of_join(bot, source_chat_id, user):
 
     for uid in sorted(ADMIN_IDS):
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 uid, f"{text}\n\n⚠️ {html.escape(reason)}",
                 parse_mode="HTML",
                 reply_markup=keyboard)
             delivered += 1
+            if getattr(sent, "message_id", None) is not None:
+                record_join_alert(source_chat_id, user.id, uid, sent.message_id)
         except TelegramError as e:
             log.warning("join alert DM to admin %s failed: %s", uid, e)
 
@@ -2583,6 +2858,125 @@ async def notify_admin_groups_of_join(bot, source_chat_id, user):
         log.error("join alert for user_id=%s in chat %s reached NOBODY - no "
                   "admin group and no admin DM succeeded", user.id, source_chat_id)
     return delivered > 0
+
+
+def screening_questions_text(name, group_title):
+    """The single message a requester receives the moment they knock.
+
+    Everything they need is in this ONE message on purpose. user_chat_id is
+    documented as usable only briefly, and only until the request is processed -
+    so the bot gets one guaranteed send. Once they reply, they have contacted
+    the bot and the DM channel is open for good, which is what makes the rest of
+    the exchange possible at all. Never split this across two sends.
+    """
+    safe_name = html.escape(name or "there")
+    safe_title = html.escape(group_title or "the group")
+    rules = (f'\n\n📖 <a href="{html.escape(RULES_CHANNEL_URL)}">Read the group rules here</a>'
+             if RULES_CHANNEL_URL else "")
+    rules_zh = (f'\n\n📖 <a href="{html.escape(RULES_CHANNEL_URL)}">点此阅读群组规则</a>'
+                if RULES_CHANNEL_URL else "")
+    return bi(
+        f"Hi {safe_name} — thanks for asking to join <b>{safe_title}</b>."
+        f"{rules}\n\n"
+        "Before an admin reviews your request, please reply to this message "
+        "(all in one message) with:\n"
+        "  <b>1.</b> How did you hear about this group?\n"
+        "  <b>2.</b> Why do you want to join?\n\n"
+        "An admin reads every answer. You will hear back here either way.",
+        f"你好 {safe_name}，感谢您申请加入 <b>{safe_title}</b>。"
+        f"{rules_zh}\n\n"
+        "在管理员审核您的申请之前，请回复本消息（请在同一条消息中回答）：\n"
+        "  <b>1.</b> 您是如何得知本群组的？\n"
+        "  <b>2.</b> 您为什么想加入？\n\n"
+        "每一份回答管理员都会阅读，无论结果如何都会在此通知您。",
+        "\n\n———\n\n")
+
+
+async def send_screening_dm(bot, chat, req):
+    """DM a fresh requester the rules link and the two screening questions.
+
+    Legal without them ever having messaged the bot: since Bot API 5.5 a bot may
+    contact anyone who has sent a join request to a chat it administers with
+    can_invite_users. Returns True if it landed.
+    """
+    user = req.from_user
+    target = getattr(req, "user_chat_id", None) or user.id
+    try:
+        await bot.send_message(
+            target,
+            screening_questions_text(user.first_name, chat.title),
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+        )
+    except TelegramError as e:
+        # Not fatal, and not unusual: privacy settings can refuse it. The admin
+        # alert still goes out, just without answers attached.
+        log.warning("screening DM to user_id=%s (chat %s) failed: %s",
+                    user.id, target, e)
+        return False
+    set_screening(chat.id, user.id, "asked")
+    log.info("SCREENING asked user_id=%s for chat %s", user.id, chat.id)
+    return True
+
+
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A DM that is not a command. Only meaningful from someone we have asked
+    the screening questions and are still waiting on."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None or user.is_bot or not msg.text:
+        return
+
+    chat_id = awaiting_answer(user.id)
+    if chat_id is None:
+        return  # not mid-screening; nothing to say
+
+    answer = msg.text.strip()
+    flags = score_answer(answer)
+    set_screening(chat_id, user.id, "answered", answer=answer, flags=flags)
+    remember_user(chat_id, user)
+    log.info("SCREENING answered user_id=%s chat=%s flags=%s len=%s",
+             user.id, chat_id, flags or "none", len(answer))
+
+    await update_join_alerts_with_answer(context.bot, chat_id, user, answer, flags)
+
+    # Consent is a separate, explicit act - and a button tap recorded against
+    # TERMS_VERSION is a far better record of it than the word "yes" appearing
+    # somewhere in a paragraph, in any of the five languages the rules exist in.
+    await context.bot.send_message(
+        msg.chat_id,
+        bi("Thank you — that has been sent to the admins.\n\nLast step: confirm "
+           "you have read and accept the group rules.",
+           "谢谢，您的回答已发送给管理员。\n\n最后一步：请确认您已阅读并接受群组规则。",
+           "\n\n———\n\n"),
+        parse_mode="HTML",
+        reply_markup=gate_keyboard(f":{chat_id}"),
+    )
+
+
+def format_screening_block(answer, flags):
+    verdict_line = ("✅ no flags" if not flags
+                    else "⚠️ " + ", ".join(flags))
+    return (f"\n\n———\n<b>Their answer</b> ({verdict_line}):\n"
+            f"<blockquote>{html.escape(answer[:700])}</blockquote>")
+
+
+async def update_join_alerts_with_answer(bot, chat_id, user, answer, flags):
+    """Edit the alerts already posted for this person so their answer appears on
+    the message admins are already looking at, rather than arriving as a second
+    notification about the same request."""
+    for notify_chat_id, message_id in get_join_alerts(chat_id, user.id):
+        try:
+            await bot.edit_message_text(
+                chat_id=notify_chat_id,
+                message_id=message_id,
+                text=build_join_alert_text(user) + format_screening_block(answer, flags),
+                parse_mode="HTML",
+                reply_markup=join_alert_keyboard(chat_id, user.id),
+            )
+        except TelegramError as e:
+            log.warning("could not attach screening answer to alert in %s: %s",
+                        notify_chat_id, e)
 
 
 async def on_claim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2706,9 +3100,17 @@ async def on_member_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # DB row is only a hint; the real check is whether they can actually send.
     if has_accepted(chat.id, member.id):
         age = acceptance_age_seconds(chat.id, member.id)
-        # A join-request approval records the acceptance in the DM seconds before
+        # A join-request approval records the acceptance in the DM shortly before
         # the member actually appears in the group. That is not a rejoin.
-        just_approved = age is not None and age < 120
+        #
+        # The open pending_requests row is the reliable half of this test. The
+        # 120-second window alone only held while consent and approval happened
+        # seconds apart; with screening, someone consents when they answer and
+        # an admin may not approve until hours later, and every one of those
+        # arrivals would have been read as a rejoin - acceptance discarded,
+        # member re-muted, having done nothing wrong.
+        just_approved = (age is not None and age < 120) \
+            or has_pending_request(chat.id, member.id)
 
         if REPROMPT_ON_REJOIN and not just_approved:
             forget_acceptance(chat.id, member.id)
@@ -2719,6 +3121,12 @@ async def on_member_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             ok, detail = await unlock_member(context.bot, chat.id, member.id)
             if ok:
+                # They are in and unmuted: the request is finished, so stop
+                # counting them as pending or they linger in /join_claims and
+                # keep a live Approve button on a handled alert.
+                clear_pending_request(chat.id, member.id)
+                clear_join_claim(chat.id, member.id)
+                clear_join_alerts(chat.id, member.id)
                 return
             log.warning("re-unlock on rejoin failed user_id=%s: %s", member.id, detail)
 
@@ -2932,14 +3340,20 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = req.chat
     remember_user(chat.id, user)
 
-    if not record_pending_request(chat.id, user.id):
+    if not record_pending_request(chat.id, user.id,
+                                  user_chat_id=getattr(req, "user_chat_id", None)):
         log.info("join request from user_id=%s in chat %s was already alerted - "
                  "not posting a second copy", user.id, chat.id)
         return
 
-    # No DM to the requester here - that's the point. They stay invisible to
-    # the group and uncontactable-by-bot-first-move until an admin approves.
-    if await notify_admin_groups_of_join(context.bot, chat.id, user):
+    # With screening on, the bot speaks first: it links the rules and asks the
+    # two questions, so the answers are already attached to the alert by the
+    # time an admin opens it. With screening off the requester is not contacted
+    # at all, and an admin does that by hand as before.
+    if SCREENING_ENABLED:
+        await send_screening_dm(context.bot, chat, req)
+
+    if await notify_admin_groups_of_join(context.bot, chat.id, user, req=req):
         mark_request_alerted(chat.id, user.id)
 
 
@@ -3000,13 +3414,17 @@ async def on_admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # "approved into the group, T&C not yet accepted" rather than being
     # cleared, since has_pending_request is what on_agree checks to accept
     # the tap as legitimate (see the forged-callback guard in _process_agree).
+    # Telegram does not guarantee from_user.id is the id of the private chat
+    # with that user, and the join request carried a user_chat_id saying where
+    # to reach them. Use it when we captured one.
+    target = dm_target(chat_id, user_id)
     try:
-        user_chat = await context.bot.get_chat(user_id)
+        user_chat = await context.bot.get_chat(target)
         safe_name = html.escape(user_chat.first_name or "there")
         group_chat = await context.bot.get_chat(chat_id)
         safe_title = html.escape(group_chat.title or "the group")
         await context.bot.send_message(
-            chat_id=user_id,
+            chat_id=target,
             text=(
                 bi(f"Hi {safe_name}, an admin has approved your request to join "
                    f"<b>{safe_title}</b>. Tap below to accept the rules before "
@@ -3182,6 +3600,30 @@ async def _process_agree(update, context, query, user, data):
         # the button spinner clears and the user is not tempted to tap again.
         await safe_answer(query, bi("Loading, please wait\u2026",
                                     "\u5904\u7406\u4e2d\uff0c\u8bf7\u7a0d\u5019\u2026", "\n"))
+
+        # With screening on, agreeing is consent - not admission. Unless the
+        # answer cleared every check AND auto-approval is switched on, the
+        # request stops here and waits for a human, which is the whole point of
+        # having turned manual approval on in the first place.
+        if SCREENING_ENABLED:
+            verdict, flags = screening_verdict(chat_id, user.id)
+            if verdict != "auto":
+                record_acceptance(chat_id, user.id, user.username, user.full_name)
+                set_screening(chat_id, user.id, "awaiting_admin")
+                log.info("SCREENING -> admin review user_id=%s chat=%s flags=%s",
+                         user.id, chat_id, flags or "none")
+                try:
+                    await query.edit_message_text(
+                        bi("\u2705 Thank you \u2014 your agreement is recorded and your "
+                           "answers are with the admins. You will hear back here "
+                           "once someone has reviewed your request.",
+                           "\u2705 \u8c22\u8c22\uff0c\u60a8\u7684\u540c\u610f\u5df2\u8bb0\u5f55\uff0c\u56de\u7b54\u4e5f\u5df2\u53d1\u9001\u7ed9\u7ba1\u7406\u5458\u3002"
+                           "\u5ba1\u6838\u5b8c\u6210\u540e\u4f1a\u5728\u6b64\u901a\u77e5\u60a8\u3002", "\n\n\u2014\u2014\u2014\n\n")
+                    )
+                except TelegramError as e:
+                    log.warning("edit_message_text failed (harmless): %s", e)
+                return
+            log.info("SCREENING -> auto-approve user_id=%s chat=%s", user.id, chat_id)
 
         try:
             await context.bot.approve_chat_join_request(chat_id, user.id)
@@ -3496,6 +3938,11 @@ def main():
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL & ~filters.COMMAND,
         on_group_message))
+    # Screening answers arrive as ordinary DMs. ~filters.COMMAND keeps this
+    # clear of the admin commands, which are all registered above.
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+        on_private_message))
     app.add_handler(CallbackQueryHandler(on_read_ack, pattern=f"^{READ_CB}"))
     app.add_handler(CallbackQueryHandler(on_agree, pattern=f"^{AGREE_CB}"))
     app.add_handler(CallbackQueryHandler(on_claim_button, pattern=f"^{CLAIM_CB}:"))
