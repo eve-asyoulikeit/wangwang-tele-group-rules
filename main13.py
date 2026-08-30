@@ -1237,7 +1237,8 @@ _last_prompted = {}   # (chat_id, user_id) -> monotonic seconds
 # and the user taps again - each repeat re-ran the whole unlock and posted
 # another confirmation. Holding this for the full handler makes it idempotent.
 _agree_in_flight = set()   # {(chat_id, user_id)}
-_last_notify = {}     # throttle key -> monotonic seconds
+_last_notify = {}     # throttle key -> wall-clock seconds (in-process fallback
+                      # only; the durable copy lives in the runtime table)
 
 
 async def notify_admins(bot, text, key="error"):
@@ -1247,14 +1248,39 @@ async def notify_admins(bot, text, key="error"):
     phone, writes to a file, and nobody reads the file until something is
     already broken. Throttled because a crash loop would otherwise send one DM
     per failed update.
+
+    The throttle is persisted rather than kept in memory. It used to be a bare
+    dict keyed on time.monotonic(), which resets when the process does - and a
+    restart loop is exactly the failure this function exists to report, so the
+    one case that most needed throttling was the one case it could not throttle
+    at all. run.sh respawns five seconds after a crash, so an error that recurs
+    on startup sent every admin a DM every five seconds for as long as it took
+    somebody to notice.
+
+    Falls back to the in-memory dict if the database cannot be read: this runs
+    on the error path, and an error reporter that raises is worse than one that
+    occasionally repeats itself.
     """
     if not ERROR_NOTIFY:
         return
-    now = time.monotonic()
-    last = _last_notify.get(key)
-    if last is not None and now - last < ERROR_NOTIFY_COOLDOWN:
+    now = time.time()
+    rkey = f"notify_last:{key}"
+    try:
+        last = float(runtime_get(rkey, "") or 0.0)
+        persisted = True
+    except (ValueError, sqlite3.Error):
+        last, persisted = _last_notify.get(key, 0.0), False
+
+    if last and now - last < ERROR_NOTIFY_COOLDOWN:
         return
+
     _last_notify[key] = now
+    if persisted:
+        try:
+            runtime_set(rkey, now)
+        except sqlite3.Error as e:
+            log.warning("could not persist notify throttle for %r: %s", key, e)
+
     for uid in sorted(ADMIN_IDS):
         try:
             await bot.send_message(uid, text[:900])
