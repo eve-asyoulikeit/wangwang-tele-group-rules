@@ -206,34 +206,32 @@ HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "0") or 0)
 # join. Their answers are attached to the admin alert, so the screening DM an
 # admin used to send by hand is already answered by the time anyone looks.
 #
-# Off by default. Turning it on changes what every new member sees.
-SCREENING_ENABLED = os.environ.get("SCREENING_ENABLED", "0").strip() \
+SCREENING_ENABLED = os.environ.get("SCREENING_ENABLED", "1").strip() \
     not in ("0", "false", "no", "")
 
-# Let a clean answer approve itself, with no admin in the loop.
+# Let an answer carrying the passphrase approve itself, with no admin involved.
 #
-# OFF by default, and worth thinking about before turning on. A human deciding
-# who gets in is currently your entire perimeter; this replaces that human with
-# a substring match, and substring matches leak - one member telling a friend
-# "just say you found us on Instagram" is the whole attack. Note also that the
-# guards below can only measure the SHAPE of an answer, never its truth.
-#
-# Screening is worth running with this off: what it buys either way is that the
-# admin's decision arrives pre-answered instead of costing a DM conversation,
-# which was always most of the work.
-SCREENING_AUTO_APPROVE = os.environ.get("SCREENING_AUTO_APPROVE", "0").strip() \
+# This is a vouching mechanism, not a spam filter, and the distinction is what
+# makes it work: the keywords below are not meant to describe a good answer,
+# they are a shared secret an admin hands to someone they are willing to admit.
+# Knowing it stands in for "a person vouched for me". It spreads the way any
+# password does - which is accepted here, because the people it spreads to are
+# people a member chose to pass it to.
+SCREENING_AUTO_APPROVE = os.environ.get("SCREENING_AUTO_APPROVE", "1").strip() \
     not in ("0", "false", "no", "")
 
-# Case-insensitive, matched as plain substrings - which is deliberate, since
-# Chinese does not separate words and a token-based match would never fire on
-# it. Tune these to your group; the defaults are a starting point, not a
-# vetting policy.
+# The passphrase. Case-insensitive, and matched with spacing ignored so
+# "WangWang" and "Wang Wang" both count - to a person telling a friend the
+# phrase, those are the same word, and a false negative here sends somebody who
+# was genuinely vouched for to the back of the manual queue.
+#
+# Matched as plain substrings rather than tokens, so a Chinese answer works
+# without word boundaries. Note the passphrase itself is Latin: a Chinese
+# speaker who was told it will almost certainly type it as given, but if you
+# want 汪汪 or 纪念 to pass on their own, add them here. They are deliberately
+# NOT included - widening a shared secret is your decision, not a default.
 SCREENING_KEYWORDS = [k.strip().lower() for k in os.environ.get(
-    "SCREENING_KEYWORDS",
-    "animal,abuse,rescue,welfare,dog,cat,stray,volunteer,adopt,advocacy,"
-    "wangwang,wang wang,friend,instagram,facebook,tiktok,news,"
-    "动物,虐待,救助,福利,流浪,"
-    "义工,领养,朋友,新闻"
+    "SCREENING_KEYWORDS", "wang wang,memorial"
 ).split(",") if k.strip()]
 
 # Answers shorter than this are treated as non-answers. Without it, "yes"
@@ -627,6 +625,26 @@ def record_pending_request(chat_id, user_id, user_chat_id=None):
     return not (row[0] or "")
 
 
+def arrival_is_expected(chat_id, user_id) -> bool:
+    """True when someone showing up in the group is the arrival we were waiting
+    for, rather than a member who left and came back.
+
+    This is what stops the "I was approved, and when I finally opened Telegram I
+    was muted" complaint. Under screening, consent happens when the person
+    answers the bot, and an admin may not approve them until hours or days
+    later. The old 120-second window read every one of those arrivals as a
+    rejoin, threw the acceptance away and re-muted them - punishing exactly the
+    people who are slow to check Telegram, which is who was complaining.
+
+    An open pending_requests row is the reliable half: it exists from the moment
+    they knock until they are through the door, so any arrival while it is open
+    is expected no matter how long it took. The time window stays as a fallback
+    for anyone admitted by a route that never created a request.
+    """
+    age = acceptance_age_seconds(chat_id, user_id)
+    return (age is not None and age < 120) or has_pending_request(chat_id, user_id)
+
+
 def dm_target(chat_id, user_id):
     """Where to DM this requester.
 
@@ -1001,8 +1019,13 @@ def score_answer(text: str):
         flags.append("too-short")
     if _LINKISH.search(body):
         flags.append("contains-link")
+    # Compare with spacing removed on both sides, so "WangWang", "wang wang"
+    # and "Wang  Wang" are one phrase rather than three near-misses.
     low = body.lower()
-    if SCREENING_KEYWORDS and not any(k in low for k in SCREENING_KEYWORDS):
+    squashed = re.sub(r"\s+", "", low)
+    if SCREENING_KEYWORDS and not any(
+            k in low or re.sub(r"\s+", "", k) in squashed
+            for k in SCREENING_KEYWORDS):
         flags.append("no-keyword")
     return flags
 
@@ -1196,10 +1219,8 @@ def config_summary():
         + ("  - ALSO SILENCES 'gate is down' alerts" if not ERROR_NOTIFY else ""),
         f"HEARTBEAT_HOURS:    {HEARTBEAT_HOURS or 'off - nothing will tell you if the bot dies'}",
         f"SCREENING_ENABLED:  {SCREENING_ENABLED}",
-        f"SCREENING_AUTO_APPROVE: {SCREENING_AUTO_APPROVE}"
-        + ("  <- a substring match, not a human, decides who gets in"
-           if (SCREENING_ENABLED and SCREENING_AUTO_APPROVE) else ""),
-        f"SCREENING_KEYWORDS: {len(SCREENING_KEYWORDS)} term(s)"
+        f"SCREENING_AUTO_APPROVE: {SCREENING_AUTO_APPROVE}",
+        f"SCREENING_KEYWORDS: {SCREENING_KEYWORDS}"
         + ("  (ignored, screening is off)" if not SCREENING_ENABLED else ""),
         f"SCREENING_MIN_CHARS:{SCREENING_MIN_CHARS}",
         f"BILINGUAL:          {BILINGUAL} (EN + Simplified Chinese)"
@@ -1246,12 +1267,12 @@ def config_summary():
                     "the same terms - make sure they agree, or drop one.")
     if BOT_API_BASE:
         warn.append("BOT_API_BASE is set - SIMULATION MODE, not talking to Telegram.")
-    if SCREENING_ENABLED and SCREENING_AUTO_APPROVE:
+    if SCREENING_ENABLED and SCREENING_AUTO_APPROVE and not SCREENING_KEYWORDS:
         warn.append(
-            "SCREENING_AUTO_APPROVE is ON. A clean answer now admits somebody "
-            "with no admin involved, so a substring match is doing the job "
-            "manual approval was turned on to give a person. Keywords leak - "
-            "one member telling a friend what to write is enough.")
+            "SCREENING_AUTO_APPROVE is on but SCREENING_KEYWORDS is empty, so "
+            "the passphrase check never fires and any answer long enough and "
+            "free of links admits itself. Set a passphrase or turn auto-approve "
+            "off.")
     if SCREENING_ENABLED and not RULES_CHANNEL_URL:
         warn.append("Screening is on but RULES_CHANNEL_URL is unset, so the "
                     "screening DM asks people to accept rules it cannot link.")
@@ -1402,12 +1423,35 @@ def read_label():
     return bi(read_en(), read_zh(), " · ")
 
 
+def ttl_note_en():
+    """The 'this will disappear' sentence, derived from the actual TTL.
+
+    It used to say "5 minutes" in four hardcoded places while PROMPT_TTL_SECONDS
+    defaulted to 0, meaning never - so the bot promised a deletion that was not
+    coming, and changing the setting silently made every one of those sentences
+    wrong. Saying nothing when nothing will be deleted is the honest version.
+    """
+    if PROMPT_TTL_SECONDS <= 0:
+        return ""
+    mins = max(1, round(PROMPT_TTL_SECONDS / 60))
+    return (f" This message disappears in about {mins} minute(s) - the pinned "
+            "rules message stays, so take as long as you need there.")
+
+
+def ttl_note_zh():
+    if PROMPT_TTL_SECONDS <= 0:
+        return ""
+    mins = max(1, round(PROMPT_TTL_SECONDS / 60))
+    return (f"本消息将在约 {mins} 分钟后自动删除；置顶的规则消息会一直保留，"
+            "您可以在那里慢慢阅读。")
+
+
 def gate_instruction():
     """One sentence telling a member exactly what to tap, matching the keyboard
     that gate_keyboard() actually renders. Never hardcode button text elsewhere -
     it drifts the moment REQUIRE_READ_ACK changes."""
     if REQUIRE_READ_ACK:
-        return (f"tap '{read_en()}' and then '{agree_en()}'. This message will disappear 5 minutes later, refer to pinned message if you need more time to read the rules and agree to the TnCs.")
+        return f"tap '{read_en()}' and then '{agree_en()}'.{ttl_note_en()}"
     return f"tap '{agree_en()}'"
 
 
@@ -1415,9 +1459,7 @@ def gate_instruction_zh():
     """Chinese counterpart of gate_instruction(). Kept as a separate function
     for the same reason: change the keyboard and both must change together."""
     if REQUIRE_READ_ACK:
-        return (f"请点击“{read_zh()}”，然后点击“{agree_zh()}”。"
-                "本消息将在 5 分钟后自动删除；若需更多时间阅读规则并同意条款，"
-                "请参阅置顶消息。")
+        return f"请点击“{read_zh()}”，然后点击“{agree_zh()}”。{ttl_note_zh()}"
     return f"请点击“{agree_zh()}”"
 
 
@@ -3109,8 +3151,7 @@ async def on_member_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # an admin may not approve until hours later, and every one of those
         # arrivals would have been read as a rejoin - acceptance discarded,
         # member re-muted, having done nothing wrong.
-        just_approved = (age is not None and age < 120) \
-            or has_pending_request(chat.id, member.id)
+        just_approved = arrival_is_expected(chat.id, member.id)
 
         if REPROMPT_ON_REJOIN and not just_approved:
             forget_acceptance(chat.id, member.id)
@@ -3143,9 +3184,9 @@ async def on_member_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_prompt(
         context.bot, chat.id,
         bi(f"Welcome, {member.mention_html()}! Please {gate_instruction()} "
-           f"on {where} to unlock messaging. This message will auto-delete after 5 minutes.",
+           f"on {where} to unlock messaging.{ttl_note_en()}",
            f"欢迎 {member.mention_html()}！{gate_instruction_zh()}"
-           f"（见{where}），即可发言。这条信息将在5分钟后自动删除。", "\n\n"),
+           f"（见{where}），即可发言。{ttl_note_zh()}", "\n\n"),
         for_user=member.id,
         parse_mode="HTML",
     )
@@ -3442,6 +3483,20 @@ async def on_admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dm_status = ("⚠️ Could not DM them the T&C (they may need to message "
                     "the bot first, or have DMs closed) - they're in the group "
                     "but still muted until they receive and accept it.")
+
+    # Say plainly which of the two states they are about to arrive in. Approving
+    # somebody who has not agreed yet is legitimate - you may simply know them -
+    # but it puts them in the group muted, and that is the exact situation people
+    # were finding themselves in with no idea why. Better the admin reads it here
+    # than the member discovers it a week later.
+    if has_accepted(chat_id, user_id):
+        dm_status += ("\n\n✅ They already accepted the terms, so they arrive "
+                      "able to post straight away.")
+    else:
+        dm_status += ("\n\n🔇 They have NOT accepted the terms yet, so they will "
+                      "arrive muted until they tap Agree on the message I just "
+                      "sent them. That is expected - just be aware they cannot "
+                      "post in the meantime.")
 
     # Update the alert message
     if query.message:
@@ -3755,8 +3810,8 @@ async def _process_agree(update, context, query, user, data):
     # keys on for_user) if the member is later re-gated.
     await send_prompt(
         context.bot, chat_id,
-        bi(f"{user.mention_html()} - thanks, you can now send messages! This message will auto-delete in 5 minutes.",
-           f"{user.mention_html()} - 谢谢，您现在可以发言了！这条信息将在5分钟后自动删除。", "\n\n"),
+        bi(f"{user.mention_html()} - thanks, you can now send messages!{ttl_note_en()}",
+           f"{user.mention_html()} - 谢谢，您现在可以发言了！{ttl_note_zh()}", "\n\n"),
         parse_mode="HTML",
         message_thread_id=thread,
     )
@@ -3845,6 +3900,36 @@ async def on_startup(app):
                 "path is not setting TERMS_VERSION - check your boot script and "
                 "gate-bot.env. Those members count as accepted again.",
                 TERMS_VERSION, n, v)
+
+    # A passphrase printed on the door is not a passphrase. Telegram shows the
+    # group's title and photo on the join-request confirmation sheet, and the
+    # screening DM greets people by that same title - so a keyword that appears
+    # in the title is handed to every requester before they are asked for it,
+    # including the ones it exists to keep out. Only a live title can tell us,
+    # which is why this runs here rather than in config_summary.
+    if SCREENING_ENABLED and SCREENING_AUTO_APPROVE and SCREENING_KEYWORDS:
+        for cid in gate_chats():
+            try:
+                info = await app.bot.get_chat(cid)
+            except TelegramError as e:
+                log.warning("could not check chat %s title for keyword leaks: %s", cid, e)
+                continue
+            title = (info.title or "").lower()
+            exposed = [k for k in SCREENING_KEYWORDS if k and k in title]
+            if exposed:
+                msg = (
+                    f"⚠️ Passphrase visible in the group name.\n\n"
+                    f"{info.title!r} contains: {', '.join(exposed)}\n\n"
+                    "Telegram shows the group title on the join-request screen, and "
+                    "my screening DM greets people by it, so anyone requesting to "
+                    "join is shown these words before I ask for them. Auto-approval "
+                    "is currently letting that answer in on its own.\n\n"
+                    "Either pick a passphrase that does not appear in the title "
+                    "(SCREENING_KEYWORDS) or turn SCREENING_AUTO_APPROVE off."
+                )
+                log.warning("KEYWORD LEAK in chat %s: title %r contains %s",
+                            cid, info.title, exposed)
+                await notify_admins(app.bot, msg, key=f"kwleak:{cid}")
 
     if app.job_queue is None:
         log.warning(

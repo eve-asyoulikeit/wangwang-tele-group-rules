@@ -26,48 +26,63 @@ def load(**over):
 
 CHAT, USER = -1001234567890, 99001
 
-# ------------------------------------------------------- answer scoring
-print("\n[1] red flags on an answer")
+# ------------------------------------------------------- passphrase scoring
+print("\n[1] the passphrase decides, length and links veto")
 m = load(SCREENING_ENABLED=1)
-GOOD = "A friend sent it to me on Instagram. I want to help with animal rescue in my area."
-check("substantive, on-topic answer -> clean", m.score_answer(GOOD), [])
+check("configured passphrase is exactly the two agreed terms",
+      m.SCREENING_KEYWORDS, ["wang wang", "memorial"])
+
+GOOD = "My friend Sarah told me about the wang wang memorial group and I want to help."
+check("vouched answer -> clean", m.score_answer(GOOD), [])
 check("empty -> no-answer", m.score_answer("   "), ["no-answer"])
-check("'yes' -> too short and off-topic",
-      sorted(m.score_answer("yes")), ["no-keyword", "too-short"])
-check("promo link is flagged even when it says the right words",
-      sorted(m.score_answer("I love animal rescue, join my channel https://t.me/spam now")),
+check("substantive but no passphrase -> no-keyword",
+      m.score_answer("A friend sent it to me on Instagram, I want to help animals."),
+      ["no-keyword"])
+check("bare passphrase is too short to be an answer",
+      sorted(m.score_answer("wang wang")), ["too-short"])
+check("passphrase plus a promo link -> vetoed",
+      m.score_answer("here for the wang wang memorial, also join https://t.me/spam"),
       ["contains-link"])
-check("bare @handle is flagged too",
-      "contains-link" in m.score_answer("found via @somepromochannel, i like animals and rescue work"), True)
-check("Chinese answer matches without word boundaries",
-      m.score_answer("朋友介绍的，我想帮助流浪动物，反对虐待动物。"), [])
-check("long but entirely off-topic -> no-keyword",
-      m.score_answer("I was just browsing around one evening and thought this looked interesting enough"),
+check("passphrase plus an @handle -> vetoed",
+      m.score_answer("told about the wang wang memorial by @somepromochannel here"),
+      ["contains-link"])
+
+print("\n[2] spacing and case are not near-misses")
+for variant in ["wang wang", "Wang Wang", "WANG WANG", "wangwang", "WangWang", "Wang  Wang"]:
+    txt = f"A friend told me about the {variant} group and I would like to help out."
+    check(f"{variant!r} counts as the passphrase", m.score_answer(txt), [])
+check("'memorial' alone also passes",
+      m.score_answer("I was told this is the memorial group, I would like to join and help."), [])
+check("a different name does NOT pass",
+      m.score_answer("A friend told me about the wing wong group and I want to help out."),
       ["no-keyword"])
 
-# ------------------------------------------------------- verdict, auto OFF
-print("\n[2] verdict with SCREENING_AUTO_APPROVE off (the default)")
-m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=0)
-m.set_screening(CHAT, USER, "answered", answer=GOOD, flags=m.score_answer(GOOD))
-check("even a perfect answer goes to a human", m.screening_verdict(CHAT, USER), ("review", []))
+print("\n[3] the passphrase works inside a Chinese answer")
+check("Latin passphrase inside Chinese text passes",
+      m.score_answer("朋友告诉我这是 wang wang 的纪念群组，我想帮忙。"), [])
+check("Chinese with no passphrase -> goes to a human",
+      m.score_answer("朋友介绍的，我想帮助流浪动物，反对虐待动物。"), ["no-keyword"])
 
-# ------------------------------------------------------- verdict, auto ON
-print("\n[3] verdict with SCREENING_AUTO_APPROVE on")
+# ------------------------------------------------------- verdict
+print("\n[4] verdict")
 m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
 m.set_screening(CHAT, USER, "answered", answer=GOOD, flags=m.score_answer(GOOD))
-check("clean answer -> auto", m.screening_verdict(CHAT, USER), ("auto", []))
+check("vouched, substantive, link-free -> auto", m.screening_verdict(CHAT, USER), ("auto", []))
 
-m.set_screening(CHAT, USER, "answered", answer="yes", flags=m.score_answer("yes"))
-v, f = m.screening_verdict(CHAT, USER)
-check("'yes' cannot buy its way in", v, "review")
-
-spam = "I love animal rescue and stray dogs, see https://t.me/x"
-m.set_screening(CHAT, USER, "answered", answer=spam, flags=m.score_answer(spam))
-check("keywords present but a link -> still a human", m.screening_verdict(CHAT, USER)[0], "review")
+for label, ans in [("no passphrase", "Found it on Instagram, I care about animals a lot."),
+                   ("bare passphrase", "wang wang"),
+                   ("passphrase + link", "wang wang memorial, see https://t.me/x")]:
+    m.set_screening(CHAT, USER, "answered", answer=ans, flags=m.score_answer(ans))
+    check(f"{label} -> a human looks", m.screening_verdict(CHAT, USER)[0], "review")
 
 m.set_screening(CHAT, USER, "asked")
-check("asked but never answered -> review", m.screening_verdict(CHAT, USER), ("review", ["no-answer"]))
-check("never screened at all -> review", m.screening_verdict(CHAT, 777), ("review", ["not-screened"]))
+check("asked but silent -> review", m.screening_verdict(CHAT, USER), ("review", ["no-answer"]))
+check("never screened -> review", m.screening_verdict(CHAT, 777), ("review", ["not-screened"]))
+
+m2 = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=0)
+m2.set_screening(CHAT, USER, "answered", answer=GOOD, flags=m2.score_answer(GOOD))
+check("with auto-approve off, even a vouched answer waits",
+      m2.screening_verdict(CHAT, USER), ("review", []))
 
 # ------------------------------------------------------- state machine
 print("\n[4] who owes an answer")
@@ -136,14 +151,13 @@ async def flow():
 asyncio.run(flow())
 
 # ------------------------------------------------------- script fairness
-print("\n[7] one threshold, several scripts")
+print("\n[7] one length threshold, several scripts")
 m = load(SCREENING_ENABLED=1)
 cases = [
-    ("English, substantive", "A friend sent it to me on Instagram, I want to help with animal rescue.", []),
-    ("Chinese, substantive", "朋友介绍的，我想帮助流浪动物，反对虐待动物。", []),
-    ("Chinese, terse brush-off", "动物", ["too-short"]),
-    ("Malay, substantive", "Kawan saya hantar. Saya mahu tolong animal rescue di sini.", []),
-    ("English one-worder", "animals", ["too-short"]),
+    ("English, vouched", "A friend told me about the wang wang memorial and I want to help.", []),
+    ("Chinese, vouched", "朋友说这是 wang wang 纪念群，我想出一份力。", []),
+    ("Chinese, terse", "wang wang", ["too-short"]),
+    ("Malay, vouched", "Kawan saya beritahu tentang memorial wang wang ini, saya mahu tolong.", []),
 ]
 for label, text, want in cases:
     check(f"{label} -> {want or 'clean'}", m.score_answer(text), want)
