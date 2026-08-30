@@ -305,5 +305,100 @@ check("member sees the normal accepted confirmation",
       "Accepted" in agree_q.edited, True)
 
 
+print("\n[7] a claimed request does not linger in /join_claims after it resolves")
+print("    (found while verifying screening answers stay visible after auto-approval -")
+print("     clear_join_claim() existed but was only ever called from one of the two")
+print("     places a request actually resolves)")
+
+class FakeChatMember:
+    def __init__(s, status): s.status = status
+class FakeChatMemberUpdated:
+    def __init__(s, chat, user, old_status, new_status):
+        s.chat = chat
+        s.old_chat_member = FakeChatMember(old_status)
+        s.new_chat_member = type("N", (), {"status": new_status, "user": user})()
+class FakeChatObj:
+    def __init__(s, cid): s.id = cid
+class FakeMemberUpdate:
+    def __init__(s, cmu): s.chat_member = cmu
+
+def claim_still_listed(mod, user_id):
+    with mod.db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM join_claims WHERE source_chat_id=? AND user_id=?",
+            (CHAT, user_id)).fetchone()
+    return row is not None
+
+# 7a: auto-approve clears a pre-existing claim
+m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
+user = make_requester(uid=555010, name="Gita")
+m.add_notify_chat(CHAT, NOTIFY_A)
+bot = FakeBot()
+m.record_pending_request(CHAT, user.id)
+asyncio.run(m.notify_admin_groups_of_join(bot, CHAT, user, screening_sent=True))
+m.record_join_claim(CHAT, user.id, 111, "Priya", NOTIFY_A, 5000)
+check("claim is on file before resolution", claim_still_listed(m, user.id), True)
+
+m.set_screening(CHAT, user.id, "answered", q1=GOOD_Q1, q2=GOOD_Q2,
+                flags=m.score_answer(m.combined_answer(GOOD_Q1, GOOD_Q2)))
+m.record_read_ack(CHAT, user.id)
+query = FakeQuery(f"tc_agree:{CHAT}", user)
+asyncio.run(m.on_agree(FakeUpdate(query), Ctx(bot)))
+check("7a: auto-approval clears the claim", claim_still_listed(m, user.id), False)
+
+# 7b: admin approves someone who already agreed - cleanup happens via
+# on_member_joined once they physically arrive (on_admin_approve deliberately
+# leaves pending_requests open until then - see arrival_is_expected).
+m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
+user = make_requester(uid=555011, name="Hana")
+admin = make_admin(222, "Admin Two")
+m.add_notify_chat(CHAT, NOTIFY_A)
+m.set_gate_message(CHAT, 424242)  # on_member_joined no-ops unless the gate is "live"
+bot = FakeBot()
+m.record_pending_request(CHAT, user.id)
+asyncio.run(m.notify_admin_groups_of_join(bot, CHAT, user, screening_sent=True))
+m.record_join_claim(CHAT, user.id, 111, "Priya", NOTIFY_A, 5000)
+m.set_screening(CHAT, user.id, "answered", q1="not on-topic at all here",
+                q2="just checking it out",
+                flags=m.score_answer(m.combined_answer("not on-topic at all here", "just checking it out")))
+m.record_read_ack(CHAT, user.id)
+q = FakeQuery(f"tc_agree:{CHAT}", user)
+asyncio.run(m.on_agree(FakeUpdate(q), Ctx(bot)))  # -> awaiting_admin
+check("still claimed while awaiting a human", claim_still_listed(m, user.id), True)
+
+approve_q = FakeQuery(f"jn_approve:{CHAT}:{user.id}", admin)
+asyncio.run(m.on_admin_approve(FakeUpdate(approve_q), Ctx(bot)))
+check("on_admin_approve alone does not yet clear it "
+      "(pending_requests deliberately stays open for arrival_is_expected)",
+      claim_still_listed(m, user.id), True)
+
+cmu = FakeChatMemberUpdated(FakeChatObj(CHAT), user, "left", "member")
+asyncio.run(m.on_member_joined(FakeMemberUpdate(cmu), Ctx(bot)))
+check("7b: clears once they actually arrive in the group",
+      claim_still_listed(m, user.id), False)
+
+# 7c: admin approves someone who has NOT yet agreed - cleanup waits for their
+# own Agree tap on the fallback T&C prompt, not before.
+m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
+user = make_requester(uid=555012, name="Ivan")
+admin = make_admin(111, "Admin One")
+m.add_notify_chat(CHAT, NOTIFY_A)
+bot = FakeBot()
+m.record_pending_request(CHAT, user.id)
+asyncio.run(m.notify_admin_groups_of_join(bot, CHAT, user, screening_sent=False))
+m.record_join_claim(CHAT, user.id, 111, "Priya", NOTIFY_A, 5000)
+
+approve_q = FakeQuery(f"jn_approve:{CHAT}:{user.id}", admin)
+asyncio.run(m.on_admin_approve(FakeUpdate(approve_q), Ctx(bot)))
+check("approved on judgement alone - still claimed, they haven't agreed yet",
+      claim_still_listed(m, user.id), True)
+
+m.record_read_ack(CHAT, user.id)
+agree_q = FakeQuery(f"tc_agree:{CHAT}", user)
+asyncio.run(m.on_agree(FakeUpdate(agree_q), Ctx(bot)))
+check("7c: clears once they tap Agree on the fallback prompt",
+      claim_still_listed(m, user.id), False)
+
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
