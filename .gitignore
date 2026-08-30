@@ -1,0 +1,31 @@
+# Secrets / runtime config — see main13.py's env var docs at the top of the file.
+gate-bot.env
+*.env
+.env
+
+# SQLite database (acceptances, seen_users, member_snapshot, etc.) — real
+# member PII (user IDs, usernames, full names). DB_PATH defaults to a path
+# relative to cwd, and run.sh cd's into this directory before launching, so
+# without this the live database would land inside the repo.
+acceptances.db
+acceptances.db-wal
+acceptances.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+
+# Output of the (external) member-roster snapshot script
+member_snapshot.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
