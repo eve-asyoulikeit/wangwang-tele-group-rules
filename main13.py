@@ -989,18 +989,22 @@ def get_screening(chat_id, user_id):
 
 
 def awaiting_answer(user_id):
-    """The chat this person still owes a screening answer for, newest first.
+    """(chat_id, answer_so_far) for a screening exchange still open with this
+    person, or (None, "").
 
     Keyed on user only: their reply arrives in a DM, which carries no clue about
-    which group it is about.
+    which group it is about. 'answered' counts as still open, because someone
+    who has replied but not yet agreed may still be typing - see
+    on_private_message for why the rest of it is worth waiting for.
     """
     with db() as conn:
         row = conn.execute(
-            "SELECT chat_id FROM screening WHERE user_id=? AND state='asked' "
+            "SELECT chat_id, answer FROM screening "
+            "WHERE user_id=? AND state IN ('asked','answered') "
             "ORDER BY rowid DESC LIMIT 1",
             (user_id,),
         ).fetchone()
-    return row[0] if row else None
+    return (row[0], row[1] or "") if row else (None, "")
 
 
 def score_answer(text: str):
@@ -2805,7 +2809,7 @@ def join_alert_keyboard(source_chat_id, user_id):
     ]])
 
 
-def build_join_alert_text(user, req=None):
+def build_join_alert_text(user, req=None, screening_sent=None):
     """The alert body. Rebuilt verbatim when the message is edited to append a
     screening answer, so it has to depend only on the user (and, at post time,
     the request), never on anything that has moved on since.
@@ -2831,6 +2835,18 @@ def build_join_alert_text(user, req=None):
             label = getattr(link, "name", None) or getattr(link, "invite_link", "")
             if label:
                 lines.append(f"Via link: <code>{html.escape(str(label))}</code>")
+    if screening_sent is False:
+        # Distinguishing "has not replied yet" from "never heard from us" is the
+        # difference between waiting and reaching out - and without this line an
+        # admin sees the same blank alert either way.
+        lines.append(
+            "\n⚠️ <b>I could not DM them</b>, so they have not been asked "
+            "anything. Their privacy settings may block me. They will need "
+            "approving on judgement alone, and will arrive muted until they "
+            "accept the terms."
+        )
+    elif screening_sent is True:
+        lines.append("\n⏳ Asked them the screening questions. Waiting on a reply.")
     lines.append(
         "\nThey cannot see the group yet. <b>Claim</b> to say you are handling "
         "them; <b>Approve</b> once satisfied."
@@ -2838,7 +2854,8 @@ def build_join_alert_text(user, req=None):
     return "\n".join(lines)
 
 
-async def notify_admin_groups_of_join(bot, source_chat_id, user, req=None):
+async def notify_admin_groups_of_join(bot, source_chat_id, user, req=None,
+                                      screening_sent=None):
     """Post an alert with Claim + Approve buttons to every registered admin
     group. Under manual-approval mode this is the ONLY way the requester
     gets into the group - see on_admin_approve.
@@ -2854,7 +2871,7 @@ async def notify_admin_groups_of_join(bot, source_chat_id, user, req=None):
     happened. The fallback has to not depend on one group's chat id still
     being valid.
     """
-    text = build_join_alert_text(user, req)
+    text = build_join_alert_text(user, req, screening_sent)
     keyboard = join_alert_keyboard(source_chat_id, user.id)
 
     notify_chats = get_notify_chats(source_chat_id)
@@ -2969,12 +2986,18 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if msg is None or user is None or user.is_bot or not msg.text:
         return
 
-    chat_id = awaiting_answer(user.id)
+    chat_id, prior = awaiting_answer(user.id)
     if chat_id is None:
         return  # not mid-screening; nothing to say
 
-    answer = msg.text.strip()
+    # People answer two numbered questions in two messages, whatever the prompt
+    # asks for. Taking only the first would cut an answer in half - often the
+    # half without the passphrase - and send somebody who was properly vouched
+    # for to the back of the manual queue. Anything they add before agreeing is
+    # appended and the whole thing rescored.
+    answer = f"{prior}\n{msg.text.strip()}".strip() if prior else msg.text.strip()
     flags = score_answer(answer)
+    followup = bool(prior)
     set_screening(chat_id, user.id, "answered", answer=answer, flags=flags)
     remember_user(chat_id, user)
     log.info("SCREENING answered user_id=%s chat=%s flags=%s len=%s",
@@ -2982,14 +3005,22 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update_join_alerts_with_answer(context.bot, chat_id, user, answer, flags)
 
+    if followup:
+        # They are adding to an answer we already acknowledged. The alert above
+        # now carries the fuller version; sending the buttons a second time
+        # would just bury the set they already have.
+        return
+
     # Consent is a separate, explicit act - and a button tap recorded against
     # TERMS_VERSION is a far better record of it than the word "yes" appearing
     # somewhere in a paragraph, in any of the five languages the rules exist in.
     await context.bot.send_message(
         msg.chat_id,
         bi("Thank you — that has been sent to the admins.\n\nLast step: confirm "
-           "you have read and accept the group rules.",
-           "谢谢，您的回答已发送给管理员。\n\n最后一步：请确认您已阅读并接受群组规则。",
+           "you have read and accept the group rules. You can keep typing if you "
+           "have more to add.",
+           "谢谢，您的回答已发送给管理员。\n\n最后一步：请确认您已阅读并接受群组规则。"
+           "如果还有补充，可以继续发送。",
            "\n\n———\n\n"),
         parse_mode="HTML",
         reply_markup=gate_keyboard(f":{chat_id}"),
@@ -3391,10 +3422,12 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # two questions, so the answers are already attached to the alert by the
     # time an admin opens it. With screening off the requester is not contacted
     # at all, and an admin does that by hand as before.
+    screening_sent = None
     if SCREENING_ENABLED:
-        await send_screening_dm(context.bot, chat, req)
+        screening_sent = await send_screening_dm(context.bot, chat, req)
 
-    if await notify_admin_groups_of_join(context.bot, chat.id, user, req=req):
+    if await notify_admin_groups_of_join(context.bot, chat.id, user, req=req,
+                                         screening_sent=screening_sent):
         mark_request_alerted(chat.id, user.id)
 
 

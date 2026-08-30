@@ -85,15 +85,38 @@ check("with auto-approve off, even a vouched answer waits",
       m2.screening_verdict(CHAT, USER), ("review", []))
 
 # ------------------------------------------------------- state machine
-print("\n[4] who owes an answer")
+print("\n[4] who owes an answer, and answers arriving in pieces")
 m = load(SCREENING_ENABLED=1)
-check("nobody outstanding initially", m.awaiting_answer(USER), None)
+check("nobody outstanding initially", m.awaiting_answer(USER), (None, ""))
 m.set_screening(CHAT, USER, "asked")
-check("after being asked, we are waiting on them", m.awaiting_answer(USER), CHAT)
+check("after being asked, we are waiting on them", m.awaiting_answer(USER), (CHAT, ""))
 m.set_screening(CHAT, USER, "answered", answer=GOOD, flags=[])
-check("after answering, no longer waiting", m.awaiting_answer(USER), None)
 state, ans, flags = m.get_screening(CHAT, USER)
 check("answer is stored verbatim", (state, ans), ("answered", GOOD))
+check("still open after a reply, so a follow-up can be appended",
+      m.awaiting_answer(USER), (CHAT, GOOD))
+
+# People answer two numbered questions in two messages. Taking only the first
+# would drop the half carrying the passphrase.
+m2 = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
+m2.set_screening(CHAT, USER, "asked")
+first = "A friend of mine sent me the invite link a couple of days ago."
+check("first half alone misses the passphrase", m2.score_answer(first), ["no-keyword"])
+m2.set_screening(CHAT, USER, "answered", answer=first, flags=m2.score_answer(first))
+check("and on its own would go to manual review",
+      m2.screening_verdict(CHAT, USER)[0], "review")
+
+cid, prior = m2.awaiting_answer(USER)
+second = "I want to help because it is the wang wang memorial group."
+combined = f"{prior}\n{second}"
+m2.set_screening(cid, USER, "answered", answer=combined, flags=m2.score_answer(combined))
+check("with the second message appended, the passphrase is found",
+      m2.score_answer(combined), [])
+check("-> the split answer now auto-approves",
+      m2.screening_verdict(CHAT, USER), ("auto", []))
+check("both halves are kept for the admin to read",
+      first in m2.get_screening(CHAT, USER)[1] and second in m2.get_screening(CHAT, USER)[1],
+      True)
 
 # ------------------------------------------------------- dm target (finding 03)
 print("\n[5] DM target uses user_chat_id")
@@ -120,6 +143,14 @@ txt = m.build_join_alert_text(U(), Req())
 check("bio surfaced on the alert", "crypto trader DM me" in txt, True)
 check("which link they used is surfaced", "IG bio Aug26" in txt, True)
 check("no request object still renders", "New join request" in m.build_join_alert_text(U()), True)
+check("a delivered screening DM shows as waiting",
+      "Waiting on a reply" in m.build_join_alert_text(U(), Req(), screening_sent=True), True)
+check("an undeliverable DM is called out, not left blank",
+      "could not DM them" in m.build_join_alert_text(U(), Req(), screening_sent=False), True)
+check("screening off -> neither line appears",
+      ("could not DM" in m.build_join_alert_text(U(), Req(), screening_sent=None)
+       or "Waiting on a reply" in m.build_join_alert_text(U(), Req(), screening_sent=None)),
+      False)
 
 class Msg:
     def __init__(s, i): s.message_id = i
