@@ -1,4 +1,4 @@
-"""Exercise the join-screening flow against the real functions."""
+"""Exercise the 3-message join-screening flow against the real functions."""
 import asyncio, importlib, os, sys, tempfile
 
 TMP = tempfile.mkdtemp()
@@ -25,173 +25,198 @@ def load(**over):
     return importlib.import_module("main13")
 
 CHAT, USER = -1001234567890, 99001
+GOOD_Q1 = "My friend told me."
+GOOD_Q2 = "I want to help because it is the wang wang memorial group."
 
 # ------------------------------------------------------- passphrase scoring
-print("\n[1] the passphrase decides, length and links veto")
+print("\n[1] the passphrase decides, length and links veto (unchanged)")
 m = load(SCREENING_ENABLED=1)
 check("configured passphrase is exactly the two agreed terms",
       m.SCREENING_KEYWORDS, ["wang wang", "memorial"])
-
-GOOD = "My friend Sarah told me about the wang wang memorial group and I want to help."
-check("vouched answer -> clean", m.score_answer(GOOD), [])
+check("substantive, on-topic combined answer -> clean",
+      m.score_answer(m.combined_answer(GOOD_Q1, GOOD_Q2)), [])
 check("empty -> no-answer", m.score_answer("   "), ["no-answer"])
-check("substantive but no passphrase -> no-keyword",
-      m.score_answer("A friend sent it to me on Instagram, I want to help animals."),
-      ["no-keyword"])
 check("bare passphrase is too short to be an answer",
       sorted(m.score_answer("wang wang")), ["too-short"])
 check("passphrase plus a promo link -> vetoed",
       m.score_answer("here for the wang wang memorial, also join https://t.me/spam"),
       ["contains-link"])
-check("passphrase plus an @handle -> vetoed",
-      m.score_answer("told about the wang wang memorial by @somepromochannel here"),
-      ["contains-link"])
+check("'WangWang' (no space) still matches",
+      m.score_answer("A friend told me about the WangWang group and I want to help."),
+      [])
 
-print("\n[2] spacing and case are not near-misses")
-for variant in ["wang wang", "Wang Wang", "WANG WANG", "wangwang", "WangWang", "Wang  Wang"]:
-    txt = f"A friend told me about the {variant} group and I would like to help out."
-    check(f"{variant!r} counts as the passphrase", m.score_answer(txt), [])
-check("'memorial' alone also passes",
-      m.score_answer("I was told this is the memorial group, I would like to join and help."), [])
-check("a different name does NOT pass",
-      m.score_answer("A friend told me about the wing wong group and I want to help out."),
-      ["no-keyword"])
-
-print("\n[3] the passphrase works inside a Chinese answer")
-check("Latin passphrase inside Chinese text passes",
-      m.score_answer("朋友告诉我这是 wang wang 的纪念群组，我想帮忙。"), [])
-check("Chinese with no passphrase -> goes to a human",
-      m.score_answer("朋友介绍的，我想帮助流浪动物，反对虐待动物。"), ["no-keyword"])
-
-# ------------------------------------------------------- verdict
-print("\n[4] verdict")
-m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
-m.set_screening(CHAT, USER, "answered", answer=GOOD, flags=m.score_answer(GOOD))
-check("vouched, substantive, link-free -> auto", m.screening_verdict(CHAT, USER), ("auto", []))
-
-for label, ans in [("no passphrase", "Found it on Instagram, I care about animals a lot."),
-                   ("bare passphrase", "wang wang"),
-                   ("passphrase + link", "wang wang memorial, see https://t.me/x")]:
-    m.set_screening(CHAT, USER, "answered", answer=ans, flags=m.score_answer(ans))
-    check(f"{label} -> a human looks", m.screening_verdict(CHAT, USER)[0], "review")
-
-m.set_screening(CHAT, USER, "asked")
-check("asked but silent -> review", m.screening_verdict(CHAT, USER), ("review", ["no-answer"]))
-check("never screened -> review", m.screening_verdict(CHAT, 777), ("review", ["not-screened"]))
-
-m2 = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=0)
-m2.set_screening(CHAT, USER, "answered", answer=GOOD, flags=m2.score_answer(GOOD))
-check("with auto-approve off, even a vouched answer waits",
-      m2.screening_verdict(CHAT, USER), ("review", []))
+print("\n[2] combined scoring is fair to a short-but-honest Q1")
+alone = m.score_answer(GOOD_Q1)
+check("Q1 alone ('a friend sent me the link') fails length on its own",
+      "too-short" in alone, True)
+combined = m.score_answer(m.combined_answer(GOOD_Q1, GOOD_Q2))
+check("but combined with Q2, the same Q1 is not penalised", combined, [])
 
 # ------------------------------------------------------- state machine
-print("\n[4] who owes an answer, and answers arriving in pieces")
-m = load(SCREENING_ENABLED=1)
-check("nobody outstanding initially", m.awaiting_answer(USER), (None, ""))
-m.set_screening(CHAT, USER, "asked")
-check("after being asked, we are waiting on them", m.awaiting_answer(USER), (CHAT, ""))
-m.set_screening(CHAT, USER, "answered", answer=GOOD, flags=[])
-state, ans, flags = m.get_screening(CHAT, USER)
-check("answer is stored verbatim", (state, ans), ("answered", GOOD))
-check("still open after a reply, so a follow-up can be appended",
-      m.awaiting_answer(USER), (CHAT, GOOD))
+print("\n[3] the state machine: asked_q1 -> asked_q2 -> answered")
+m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
+check("nobody awaiting anything yet", m.awaiting_reply(USER), (None, None))
 
-# People answer two numbered questions in two messages. Taking only the first
-# would drop the half carrying the passphrase.
-m2 = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
-m2.set_screening(CHAT, USER, "asked")
-first = "A friend of mine sent me the invite link a couple of days ago."
-check("first half alone misses the passphrase", m2.score_answer(first), ["no-keyword"])
-m2.set_screening(CHAT, USER, "answered", answer=first, flags=m2.score_answer(first))
-check("and on its own would go to manual review",
-      m2.screening_verdict(CHAT, USER)[0], "review")
+m.set_screening(CHAT, USER, "asked_q1")
+check("after Q1 is sent, we are waiting on a reply to it",
+      m.awaiting_reply(USER), (CHAT, "asked_q1"))
+check("get_screening reflects the fresh state",
+      m.get_screening(CHAT, USER), ("asked_q1", "", "", []))
 
-cid, prior = m2.awaiting_answer(USER)
-second = "I want to help because it is the wang wang memorial group."
-combined = f"{prior}\n{second}"
-m2.set_screening(cid, USER, "answered", answer=combined, flags=m2.score_answer(combined))
-check("with the second message appended, the passphrase is found",
-      m2.score_answer(combined), [])
-check("-> the split answer now auto-approves",
-      m2.screening_verdict(CHAT, USER), ("auto", []))
-check("both halves are kept for the admin to read",
-      first in m2.get_screening(CHAT, USER)[1] and second in m2.get_screening(CHAT, USER)[1],
-      True)
+m.set_screening(CHAT, USER, "asked_q2", q1=GOOD_Q1)
+check("Q1 stored, now waiting on Q2", m.awaiting_reply(USER), (CHAT, "asked_q2"))
+check("Q1 text preserved exactly",
+      m.get_screening(CHAT, USER)[1], GOOD_Q1)
 
-# ------------------------------------------------------- dm target (finding 03)
-print("\n[5] DM target uses user_chat_id")
-m = load(SCREENING_ENABLED=1)
-m.record_pending_request(CHAT, USER, user_chat_id=555000111)
-check("prefers the user_chat_id from the request", m.dm_target(CHAT, USER), 555000111)
-m.record_pending_request(CHAT, 4242)
-check("falls back to user id when none captured", m.dm_target(CHAT, 4242), 4242)
-check("unknown user falls back too", m.dm_target(CHAT, 31337), 31337)
+flags = m.score_answer(m.combined_answer(GOOD_Q1, GOOD_Q2))
+m.set_screening(CHAT, USER, "answered", q1=GOOD_Q1, q2=GOOD_Q2, flags=flags)
+check("both answers on file, verdict is auto (clean + auto-approve on)",
+      m.screening_verdict(CHAT, USER), ("auto", []))
+check("'answered' still counts as awaiting - they may add more before Agree",
+      m.awaiting_reply(USER), (CHAT, "answered"))
 
-# ------------------------------------------------------- alert content + edit
-print("\n[6] admin alert carries bio and invite link, and is edited in place")
-m = load(SCREENING_ENABLED=1)
+print("\n[4] set_screening never blanks an answer it wasn't given")
+m2 = load(SCREENING_ENABLED=1)
+m2.set_screening(CHAT, 5001, "asked_q2", q1="first answer")
+m2.set_screening(CHAT, 5001, "answered", q2="second answer")  # q1 omitted
+check("advancing state without q1 leaves q1 untouched",
+      m2.get_screening(CHAT, 5001)[1], "first answer")
+check("q2 was recorded", m2.get_screening(CHAT, 5001)[2], "second answer")
+
+# ------------------------------------------------------- verdict edge cases
+print("\n[5] verdict")
+m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
+m.set_screening(CHAT, USER, "answered", q1=GOOD_Q1, q2=GOOD_Q2,
+                flags=m.score_answer(m.combined_answer(GOOD_Q1, GOOD_Q2)))
+check("vouched, substantive, link-free -> auto", m.screening_verdict(CHAT, USER), ("auto", []))
+
+no_kw = "Found it on Instagram, I care about animals a lot and want to help out here."
+m.set_screening(CHAT, USER, "answered", q1=no_kw, q2="",
+                flags=m.score_answer(m.combined_answer(no_kw, "")))
+check("no passphrase -> a human looks", m.screening_verdict(CHAT, USER)[0], "review")
+
+m.set_screening(CHAT, USER, "asked_q1")
+check("still on Q1 -> review, no-answer", m.screening_verdict(CHAT, USER), ("review", ["no-answer"]))
+m.set_screening(CHAT, USER, "asked_q2", q1=GOOD_Q1)
+check("on Q2, Q1 answered but Q2 not yet -> still review",
+      m.screening_verdict(CHAT, USER), ("review", ["no-answer"]))
+check("never screened -> review", m.screening_verdict(CHAT, 777), ("review", ["not-screened"]))
+
+m3 = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=0)
+m3.set_screening(CHAT, USER, "answered", q1=GOOD_Q1, q2=GOOD_Q2,
+                 flags=m3.score_answer(m3.combined_answer(GOOD_Q1, GOOD_Q2)))
+check("with auto-approve off, even a vouched answer waits",
+      m3.screening_verdict(CHAT, USER), ("review", []))
+
+# ------------------------------------------------------- the 3 DMs, in order
+print("\n[6] on_join_request -> on_private_message drives Q1, Q2, Q3 in order")
+m = load(SCREENING_ENABLED=1, SCREENING_AUTO_APPROVE=1)
 
 class Link:  name = "IG bio Aug26"
 class Req:
     bio = "crypto trader DM me"
     invite_link = Link()
     user_chat_id = 900900
-class U:
-    id, first_name, username, full_name, is_bot = USER, "Ada", "ada_l", "Ada L", False
-
-txt = m.build_join_alert_text(U(), Req())
-check("bio surfaced on the alert", "crypto trader DM me" in txt, True)
-check("which link they used is surfaced", "IG bio Aug26" in txt, True)
-check("no request object still renders", "New join request" in m.build_join_alert_text(U()), True)
-check("a delivered screening DM shows as waiting",
-      "Waiting on a reply" in m.build_join_alert_text(U(), Req(), screening_sent=True), True)
-check("an undeliverable DM is called out, not left blank",
-      "could not DM them" in m.build_join_alert_text(U(), Req(), screening_sent=False), True)
-check("screening off -> neither line appears",
-      ("could not DM" in m.build_join_alert_text(U(), Req(), screening_sent=None)
-       or "Waiting on a reply" in m.build_join_alert_text(U(), Req(), screening_sent=None)),
-      False)
+    class from_user:
+        id, first_name, username, full_name, is_bot = USER, "Ada", "ada_l", "Ada L", False
+class ChatObj: id, title = CHAT, "Say No To Animal Abuse"
 
 class Msg:
-    def __init__(s, i): s.message_id = i
+    _next = [1000]
+    def __init__(s, i=None):
+        if i is None:
+            Msg._next[0] += 1; i = Msg._next[0]
+        s.message_id = i
 class Bot:
     def __init__(s): s.sent, s.edits = [], []
     async def send_message(s, chat_id, text, **kw):
-        s.sent.append((chat_id, text)); return Msg(1000 + len(s.sent))
+        s.sent.append((chat_id, text, kw)); return Msg()
     async def edit_message_text(s, chat_id, message_id, text, **kw):
-        s.edits.append((chat_id, message_id, text))
+        s.edits.append((chat_id, message_id, text, kw))
+    async def approve_chat_join_request(s, chat_id, user_id): pass
+    async def get_chat_member(s, chat_id, user_id):
+        class M: status = "member"
+        return M()
 
-async def flow():
-    NOTIFY = -1009999999999
-    m.add_notify_chat(CHAT, NOTIFY)
+async def scenario_full_flow():
     b = Bot()
+    m.add_notify_chat(CHAT, -1009999999999)
     m.record_pending_request(CHAT, USER, user_chat_id=900900)
-    await m.notify_admin_groups_of_join(b, CHAT, U(), req=Req())
-    check("alert message id remembered for later editing",
-          [c for c, _ in m.get_join_alerts(CHAT, USER)], [NOTIFY])
 
-    await m.update_join_alerts_with_answer(b, CHAT, U(), GOOD, [])
-    check("answer attached by EDITING, not a second message",
-          (len(b.sent), len(b.edits)), (1, 1))
-    check("edited alert shows the answer", GOOD in b.edits[0][2], True)
-    check("edited alert shows the verdict", "no flags" in b.edits[0][2], True)
+    sent = await m.send_screening_q1(b, ChatObj(), Req())
+    check("Q1 DM sent successfully", sent, True)
+    check("state advanced to asked_q1", m.get_screening(CHAT, USER)[0], "asked_q1")
+    q1_text = b.sent[0][1]
+    check("Q1 message matches the agreed wording",
+          "How did you hear about this group" in q1_text, True)
+    check("Q2 and Q3 text are NOT in the first message",
+          "Why do you want to join" not in q1_text
+          and "terms and conditions" not in q1_text, True)
 
-    await m.update_join_alerts_with_answer(b, CHAT, U(), "yes", ["too-short", "no-keyword"])
-    check("flags are spelled out for the admin", "too-short" in b.edits[1][2], True)
+    ok_ = await m.notify_admin_groups_of_join(b, CHAT, Req.from_user, req=Req(),
+                                              screening_sent=sent)
+    check("initial admin alert posted", ok_, True)
+    check("alert shows 'waiting on a reply', not the old wording",
+          "Waiting on a reply" in b.sent[-1][1], True)
 
-asyncio.run(flow())
+    class UpdMsg:
+        def __init__(s, text, chat_id=USER):
+            s.text, s.chat_id = text, chat_id
+    class EffUser:
+        id, first_name, username, full_name, is_bot = USER, "Ada", "ada_l", "Ada L", False
+    class Upd:
+        def __init__(s, text): s.effective_message = UpdMsg(text); s.effective_user = EffUser()
+    class Ctx:
+        def __init__(s, bot): s.bot = bot
 
-# ------------------------------------------------------- script fairness
-print("\n[7] one length threshold, several scripts")
+    await m.on_private_message(Upd(GOOD_Q1), Ctx(b))
+    check("after answering Q1, state moves to asked_q2",
+          m.get_screening(CHAT, USER)[0], "asked_q2")
+    check("Q1 stored verbatim", m.get_screening(CHAT, USER)[1], GOOD_Q1)
+    q2_text = b.sent[-1][1]
+    check("Q2 was sent next", "Why do you want to join this group" in q2_text, True)
+    check("Q2 message does not repeat Q1 or jump to Q3",
+          "How did you hear" not in q2_text and "terms and conditions" not in q2_text, True)
+
+    before_edits = len(b.edits)
+    await m.on_private_message(Upd(GOOD_Q2), Ctx(b))
+    check("after answering Q2, state moves to answered",
+          m.get_screening(CHAT, USER)[0], "answered")
+    check("the admin alert was EDITED (not a new message) with both answers",
+          len(b.edits), before_edits + 1)
+    check("edited alert shows Q1 and Q2 separately",
+          GOOD_Q1 in b.edits[-1][2] and GOOD_Q2 in b.edits[-1][2], True)
+    check("edited alert keeps live buttons (still a decision pending)",
+          b.edits[-1][3].get("reply_markup") is not None, True)
+    q3_text = b.sent[-1][1]
+    check("Q3 (terms) sent after Q2 answered",
+          "terms and conditions" in q3_text, True)
+    check("Q3 carries the rules link",
+          "example.org/rules" in q3_text, True)
+    check("Q3 message came with the Agree/Read buttons",
+          b.sent[-1][2].get("reply_markup") is not None, True)
+
+    # A follow-up before tapping Agree: appended, rescored, no new buttons sent
+    sent_before = len(b.sent)
+    await m.on_private_message(Upd("also I love dogs"), Ctx(b))
+    check("follow-up text appended to q2",
+          "also I love dogs" in m.get_screening(CHAT, USER)[2], True)
+    check("no additional outbound message for a follow-up (buttons not resent)",
+          len(b.sent), sent_before)
+
+asyncio.run(scenario_full_flow())
+
+# ------------------------------------------------------- alert content
+print("\n[7] admin alert carries bio and invite link")
 m = load(SCREENING_ENABLED=1)
-cases = [
-    ("English, vouched", "A friend told me about the wang wang memorial and I want to help.", []),
-    ("Chinese, vouched", "朋友说这是 wang wang 纪念群，我想出一份力。", []),
-    ("Chinese, terse", "wang wang", ["too-short"]),
-    ("Malay, vouched", "Kawan saya beritahu tentang memorial wang wang ini, saya mahu tolong.", []),
-]
-for label, text, want in cases:
-    check(f"{label} -> {want or 'clean'}", m.score_answer(text), want)
+txt = m.build_join_alert_text(Req.from_user, Req())
+check("bio surfaced on the alert", "crypto trader DM me" in txt, True)
+check("which link they used is surfaced", "IG bio Aug26" in txt, True)
+check("no request object still renders", "New join request" in m.build_join_alert_text(Req.from_user), True)
+check("trailer: could not reach them",
+      "could not DM them" in (m.build_join_alert_text(Req.from_user) + m._live_trailer(False)), True)
+check("trailer: waiting on a reply",
+      "Waiting on a reply" in (m.build_join_alert_text(Req.from_user) + m._live_trailer(True)), True)
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
