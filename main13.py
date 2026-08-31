@@ -237,6 +237,18 @@ SCREENING_KEYWORDS = [k.strip().lower() for k in os.environ.get(
 # Answers shorter than this are treated as non-answers. Without it, "yes"
 # clears the bar that asking two open questions exists to set.
 SCREENING_MIN_CHARS = int(os.environ.get("SCREENING_MIN_CHARS", "25"))
+
+# Seconds to wait after a screening reply before treating it as final and
+# moving on to the next question. Mobile texters send a thought in two or
+# three quick messages rather than one - without this, the first fragment
+# alone became the whole answer to Q1 and the very next fragment, meant to
+# finish that same thought, was filed as the answer to Q2 instead, and Q3
+# fired before the person had said why they wanted to join at all. A message
+# arriving inside the window resets it, so the wait is "since their last
+# message," not a hard cap - only silence this long is treated as "done
+# typing." 0 disables debouncing and reverts to advancing on every message
+# immediately (also the automatic fallback if job_queue is unavailable).
+SCREENING_DEBOUNCE_SECONDS = float(os.environ.get("SCREENING_DEBOUNCE_SECONDS", "8") or 0)
 # Seconds between error DMs. A crash loop must not turn into a DM flood.
 ERROR_NOTIFY_COOLDOWN = int(os.environ.get("ERROR_NOTIFY_COOLDOWN", "300"))
 
@@ -1309,6 +1321,9 @@ def config_summary():
         f"SCREENING_KEYWORDS: {SCREENING_KEYWORDS}"
         + ("  (ignored, screening is off)" if not SCREENING_ENABLED else ""),
         f"SCREENING_MIN_CHARS:{SCREENING_MIN_CHARS}",
+        f"SCREENING_DEBOUNCE_SECONDS: {SCREENING_DEBOUNCE_SECONDS}"
+        + ("  (off - every message advances immediately)"
+           if SCREENING_DEBOUNCE_SECONDS <= 0 else ""),
         f"BILINGUAL:          {BILINGUAL} (EN + Simplified Chinese)"
         + ("  (prompts never deleted)" if not PROMPT_TTL_SECONDS else ""),
         f"BOT_API_BASE:       {BOT_API_BASE or '(unset - talking to real Telegram)'}",
@@ -3083,9 +3098,86 @@ async def send_screening_q1(bot, chat, req):
     return True
 
 
+# Fragments waiting out the debounce window, keyed by (chat_id, user_id). Not
+# persisted: lost on restart is the harmless direction, same as the rest of
+# this file's in-memory state - worst case a fragment sent right at the
+# restart boundary is treated as a complete answer on its own instead of
+# being joined with one sent moments before, which is exactly what happens
+# with debouncing off. Never read without _debounce_lock held, since a
+# restart-recovered webhook replay and a live message for the same person
+# could otherwise race on read-modify-write.
+_pending_fragments = {}   # (chat_id, user_id) -> accumulated text so far
+_debounce_lock = asyncio.Lock()
+
+
+def _debounce_job_name(chat_id, user_id):
+    return f"screening_debounce:{chat_id}:{user_id}"
+
+
+async def _finalize_screening_stage(bot, chat_id, user, state, text):
+    """The actual state transition for one screening stage, run either
+    immediately (debouncing off, or no job_queue) or once the debounce
+    window has passed with no further message. Shared so both paths do
+    exactly the same thing.
+    """
+    if state == "asked_q1":
+        set_screening(chat_id, user.id, "asked_q2", q1=text)
+        log.info("SCREENING q1 answered user_id=%s chat=%s len=%s",
+                 user.id, chat_id, len(text))
+        try:
+            await bot.send_message(user.id, screening_q2_text(), parse_mode="HTML")
+        except TelegramError as e:
+            log.warning("screening Q2 send failed user_id=%s: %s", user.id, e)
+
+    elif state == "asked_q2":
+        _, q1, _, _ = get_screening(chat_id, user.id)
+        flags = score_answer(combined_answer(q1, text))
+        set_screening(chat_id, user.id, "answered", q1=q1, q2=text, flags=flags)
+        log.info("SCREENING q2 answered user_id=%s chat=%s flags=%s",
+                 user.id, chat_id, flags or "none")
+        await update_join_alerts_with_answer(bot, chat_id, user, q1, text, flags)
+        try:
+            await bot.send_message(user.id, screening_q3_text(), parse_mode="HTML",
+                                   reply_markup=gate_keyboard(f":{chat_id}"))
+        except TelegramError as e:
+            log.warning("screening Q3 send failed user_id=%s: %s", user.id, e)
+
+    elif state == "answered":
+        # They are typing more before tapping Agree - Q3's buttons are already
+        # on screen. Appended to Q2 rather than dropped, and rescored: it can
+        # still supply the passphrase if they forgot it the first time.
+        _, q1, q2, _ = get_screening(chat_id, user.id)
+        q2 = f"{q2}\n{text}".strip() if q2 else text
+        flags = score_answer(combined_answer(q1, q2))
+        set_screening(chat_id, user.id, "answered", q1=q1, q2=q2, flags=flags)
+        log.info("SCREENING follow-up user_id=%s chat=%s flags=%s",
+                 user.id, chat_id, flags or "none")
+        await update_join_alerts_with_answer(bot, chat_id, user, q1, q2, flags)
+        # Q3's buttons were already sent; nothing more to send here.
+
+
+async def _run_debounced_stage(context: ContextTypes.DEFAULT_TYPE):
+    """job_queue callback: the debounce window elapsed with no further
+    message, so whatever accumulated is final."""
+    data = context.job.data
+    chat_id, user, state = data["chat_id"], data["user"], data["state"]
+    async with _debounce_lock:
+        text = _pending_fragments.pop((chat_id, user.id), "").strip()
+    if not text:
+        return  # a race emptied it (e.g. state moved on some other way); nothing to finalize
+    await _finalize_screening_stage(context.bot, chat_id, user, state, text)
+
+
 async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """A DM that is not a command. Only meaningful from someone mid-screening:
-    routes their reply to whichever of the three stages they are actually on."""
+    routes their reply to whichever of the three stages they are actually on.
+
+    Waits SCREENING_DEBOUNCE_SECONDS of silence before treating a reply as
+    final, resetting on every new message - mobile texters send a thought in
+    two or three quick messages rather than one, and without this the first
+    fragment alone became the whole answer to Q1, with the very next fragment
+    (meant to finish that same thought) filed under Q2 instead.
+    """
     msg = update.effective_message
     user = update.effective_user
     if msg is None or user is None or user.is_bot or not msg.text:
@@ -3098,45 +3190,26 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = msg.text.strip()
     remember_user(chat_id, user)
 
-    if state == "asked_q1":
-        set_screening(chat_id, user.id, "asked_q2", q1=text)
-        log.info("SCREENING q1 answered user_id=%s chat=%s len=%s",
-                 user.id, chat_id, len(text))
-        try:
-            await context.bot.send_message(msg.chat_id, screening_q2_text(),
-                                           parse_mode="HTML")
-        except TelegramError as e:
-            log.warning("screening Q2 send failed user_id=%s: %s", user.id, e)
+    if SCREENING_DEBOUNCE_SECONDS <= 0 or context.job_queue is None:
+        # Debouncing off, or the job-queue extra isn't installed - the old
+        # immediate-advance behaviour. Never silently drop the message: with
+        # no job_queue, waiting would mean nothing ever finalizes at all.
+        await _finalize_screening_stage(context.bot, chat_id, user, state, text)
         return
 
-    if state == "asked_q2":
-        _, q1, _, _ = get_screening(chat_id, user.id)
-        flags = score_answer(combined_answer(q1, text))
-        set_screening(chat_id, user.id, "answered", q1=q1, q2=text, flags=flags)
-        log.info("SCREENING q2 answered user_id=%s chat=%s flags=%s",
-                 user.id, chat_id, flags or "none")
-        await update_join_alerts_with_answer(context.bot, chat_id, user, q1, text, flags)
-        try:
-            await context.bot.send_message(
-                msg.chat_id, screening_q3_text(), parse_mode="HTML",
-                reply_markup=gate_keyboard(f":{chat_id}"))
-        except TelegramError as e:
-            log.warning("screening Q3 send failed user_id=%s: %s", user.id, e)
-        return
+    key = (chat_id, user.id)
+    async with _debounce_lock:
+        prior = _pending_fragments.get(key, "")
+        _pending_fragments[key] = f"{prior}\n{text}".strip() if prior else text
 
-    if state == "answered":
-        # They are typing more before tapping Agree - Q3's buttons are already
-        # on screen. Appended to Q2 rather than dropped, and rescored: it can
-        # still supply the passphrase if they forgot it the first time.
-        _, q1, q2, _ = get_screening(chat_id, user.id)
-        q2 = f"{q2}\n{text}".strip() if q2 else text
-        flags = score_answer(combined_answer(q1, q2))
-        set_screening(chat_id, user.id, "answered", q1=q1, q2=q2, flags=flags)
-        log.info("SCREENING follow-up user_id=%s chat=%s flags=%s",
-                 user.id, chat_id, flags or "none")
-        await update_join_alerts_with_answer(context.bot, chat_id, user, q1, q2, flags)
-        # Q3's buttons were already sent; nothing more to send here.
-        return
+    name = _debounce_job_name(chat_id, user.id)
+    for job in context.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    context.job_queue.run_once(
+        _run_debounced_stage, when=SCREENING_DEBOUNCE_SECONDS,
+        data={"chat_id": chat_id, "user": user, "state": state},
+        name=name,
+    )
 
 
 def format_screening_block(q1, q2, flags):
@@ -4208,6 +4281,12 @@ async def on_startup(app):
             log.warning("HEARTBEAT_HOURS=%s but job_queue is unavailable, so no "
                         "heartbeat will be sent. Install the job-queue extra.",
                         HEARTBEAT_HOURS)
+        if SCREENING_DEBOUNCE_SECONDS > 0:
+            log.warning("SCREENING_DEBOUNCE_SECONDS=%s but job_queue is unavailable, "
+                        "so screening replies advance immediately on every message "
+                        "regardless - the on_private_message fallback for exactly this "
+                        "case, not a crash, but debouncing is not actually happening. "
+                        "Install the job-queue extra.", SCREENING_DEBOUNCE_SECONDS)
     else:
         if HEARTBEAT_HOURS > 0:
             every = HEARTBEAT_HOURS * 3600

@@ -4,7 +4,11 @@ import asyncio, importlib, os, sys, tempfile
 TMP = tempfile.mkdtemp()
 BASE = dict(BOT_TOKEN="123:FAKE", ADMIN_IDS="111,222",
             LOG_FILE=os.path.join(TMP, "t.log"), TERMS_TEXT="T",
-            RULES_CHANNEL_URL="https://example.org/rules")
+            RULES_CHANNEL_URL="https://example.org/rules",
+            # This file tests the state machine and scoring, not timing -
+            # debounce mechanics (accumulation, reset, job_queue fallback)
+            # have their own dedicated suite in tests/test_debounce.py.
+            SCREENING_DEBOUNCE_SECONDS="0")
 sys.path.insert(0, "/home/user/wangwang-tele-group-rules")
 
 ok = fail = 0
