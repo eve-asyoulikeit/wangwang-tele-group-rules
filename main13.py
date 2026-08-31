@@ -2921,15 +2921,24 @@ def build_join_alert_text(user, req=None):
     return "\n".join(lines)
 
 
-def _live_trailer(screening_sent=None):
+def _live_trailer(waiting_for=None):
     """Appended while a request is still open and needs a Claim/Approve
     prompt. Kept separate from build_join_alert_text so a resolved alert
     (finalize_join_alerts) can leave this off entirely instead of saying
     "they cannot see the group yet" underneath a line saying they are already
     in - the two used to be glued together and could not be pulled apart.
+
+    waiting_for names what is ACTUALLY still outstanding - None (screening
+    off, nothing to report), 'unreachable' (the DM bounced), 'q1' (sent
+    question 1, no reply yet), or 'agree' (both questions answered, waiting
+    on the read-then-agree tap). This used to be a screening_sent bool that
+    every caller passed True/False/None into, and update_join_alerts_with_answer
+    hardcoded True - so once someone had answered BOTH questions, the alert
+    kept insisting "waiting on question 1" directly above their two answers,
+    contradicting the very block above it.
     """
     lines = []
-    if screening_sent is False:
+    if waiting_for == "unreachable":
         # Distinguishing "has not replied yet" from "never heard from us" is the
         # difference between waiting and reaching out - and without this line an
         # admin sees the same blank alert either way.
@@ -2939,8 +2948,13 @@ def _live_trailer(screening_sent=None):
             "approving on judgement alone, and will arrive muted until they "
             "accept the terms."
         )
-    elif screening_sent is True:
+    elif waiting_for == "q1":
         lines.append("\n⏳ Asked them question 1. Waiting on a reply.")
+    elif waiting_for == "agree":
+        lines.append(
+            "\n⏳ They have answered both questions. Waiting on them to tap "
+            "Agree on the rules."
+        )
     lines.append(
         "\nThey cannot see the group yet. <b>Claim</b> to say you are handling "
         "them; <b>Approve</b> once satisfied."
@@ -2965,7 +2979,8 @@ async def notify_admin_groups_of_join(bot, source_chat_id, user, req=None,
     happened. The fallback has to not depend on one group's chat id still
     being valid.
     """
-    text = build_join_alert_text(user, req) + _live_trailer(screening_sent)
+    trailer_state = {True: "q1", False: "unreachable", None: None}[screening_sent]
+    text = build_join_alert_text(user, req) + _live_trailer(trailer_state)
     keyboard = join_alert_keyboard(source_chat_id, user.id)
 
     notify_chats = get_notify_chats(source_chat_id)
@@ -3153,7 +3168,7 @@ async def update_join_alerts_with_answer(bot, chat_id, user, q1, q2, flags):
                 chat_id=notify_chat_id,
                 message_id=message_id,
                 text=(build_join_alert_text(user) + format_screening_block(q1, q2, flags)
-                      + _live_trailer(screening_sent=True)),
+                      + _live_trailer(waiting_for="agree")),
                 parse_mode="HTML",
                 reply_markup=join_alert_keyboard(chat_id, user.id),
             )
