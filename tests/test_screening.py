@@ -214,9 +214,31 @@ check("bio surfaced on the alert", "crypto trader DM me" in txt, True)
 check("which link they used is surfaced", "IG bio Aug26" in txt, True)
 check("no request object still renders", "New join request" in m.build_join_alert_text(Req.from_user), True)
 check("trailer: could not reach them",
-      "could not DM them" in (m.build_join_alert_text(Req.from_user) + m._live_trailer(False)), True)
-check("trailer: waiting on a reply",
-      "Waiting on a reply" in (m.build_join_alert_text(Req.from_user) + m._live_trailer(True)), True)
+      "could not DM them" in (m.build_join_alert_text(Req.from_user) + m._live_trailer("unreachable")), True)
+check("trailer: waiting on question 1",
+      "Waiting on a reply" in (m.build_join_alert_text(Req.from_user) + m._live_trailer("q1")), True)
+check("trailer: waiting on the agree tap",
+      "Waiting on them to tap" in (m.build_join_alert_text(Req.from_user) + m._live_trailer("agree")), True)
+check("the three trailers are not interchangeable - 'agree' never mentions question 1",
+      "question 1" in m._live_trailer("agree"), False)
+
+print("\n[8] regression: the alert must stop claiming 'waiting on question 1' "
+      "once both questions actually have answers")
+m = load(SCREENING_ENABLED=1)
+edited = {}
+class Bot8:
+    async def edit_message_text(s, chat_id, message_id, text, **kw):
+        edited["text"] = text
+m8 = m
+m8.add_notify_chat(CHAT, -1009999999999)
+m8.record_join_alert(CHAT, USER, -1009999999999, 4242)
+asyncio.run(m8.update_join_alerts_with_answer(Bot8(), CHAT, Req.from_user, GOOD_Q1, GOOD_Q2,
+                                              m8.score_answer(m8.combined_answer(GOOD_Q1, GOOD_Q2))))
+check("both answers are shown", GOOD_Q1 in edited["text"] and GOOD_Q2 in edited["text"], True)
+check("does NOT still claim it's waiting on question 1 (the exact bug reported live)",
+      "question 1" in edited["text"], False)
+check("correctly says it's waiting on the Agree tap instead",
+      "Waiting on them to tap Agree" in edited["text"], True)
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
