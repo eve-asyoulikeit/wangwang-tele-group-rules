@@ -1578,6 +1578,14 @@ async def safe_answer(query, text=None, show_alert=False, fallback_chat_id=None,
     the member is not left staring at a spinner that never resolves.
     """
     """Best-effort toast. A stale callback query must not crash the handler."""
+    # answerCallbackQuery caps text at 200 characters and rejects the whole
+    # call if it's longer - not just truncates. A caller that interpolates a
+    # raw TelegramError (unbounded length, e.g. "Approve failed: {e}") can
+    # blow past that, and the resulting "message too long" BadRequest was
+    # being swallowed below and logged as if the tap had simply expired,
+    # burying the original error it was trying to report.
+    if text and len(text) > 200:
+        text = text[:197] + "..."
     try:
         if text:
             await query.answer(text, show_alert=show_alert)
@@ -1586,7 +1594,8 @@ async def safe_answer(query, text=None, show_alert=False, fallback_chat_id=None,
     except Exception as e:
         who = getattr(getattr(query, "from_user", None), "id", "?")
         log.warning("answer_callback_query failed for user_id=%s chat_id=%s "
-                    "(expired or stale tap): %s", who, fallback_chat_id or "?", e)
+                    "(expired/stale tap, or another answerCallbackQuery error): %s",
+                    who, fallback_chat_id or "?", e)
         if text and fallback_chat_id and bot:
             who = f"{mention} - " if mention else ""
             await send_prompt(bot, fallback_chat_id, f"{who}{text}", parse_mode="HTML")
