@@ -119,5 +119,60 @@ async def scenarios():
 
 asyncio.run(scenarios())
 
+# ---------------------------------------------------------------- stale claims
+print("\n[5] a new join request does not inherit a stale claim from a resolved one")
+print("    (reported live: an admin who never claimed a request was named as if")
+print("     they had, because their claim on that person's PREVIOUS request - which")
+print("     ended without going through either of the two places that clean up")
+print("     after one - was still on file)")
+
+STALE_USER = 99002
+STALE_NOTIFY = -1009999999998
+m.clear_pending_request(CHAT, STALE_USER)
+m.clear_join_claim(CHAT, STALE_USER)
+m.clear_join_alerts(CHAT, STALE_USER)
+
+# Their first request: an admin claims it, another admin approves it, and a
+# join_alerts row is posted - then it ends WITHOUT clear_join_claim ever
+# running (a native decline, a withdrawal, or expiry - none of which this
+# bot's own handlers observe).
+m.record_pending_request(CHAT, STALE_USER, request_date="2026-08-01T00:00:00+00:00")
+m.mark_request_alerted(CHAT, STALE_USER)
+m.record_join_claim(CHAT, STALE_USER, 111, "Elizabeth", STALE_NOTIFY, 1234)
+m.mark_admin_approved(CHAT, STALE_USER)
+m.record_join_alert(CHAT, STALE_USER, STALE_NOTIFY, 1234)
+check("stale scenario set up: claimed", m.get_join_claim(CHAT, STALE_USER) is not None, True)
+check("stale scenario set up: admin-approved", m.was_admin_approved(CHAT, STALE_USER), True)
+check("stale scenario set up: has an alert on file", m.get_join_alerts(CHAT, STALE_USER) != [], True)
+
+# A genuine Telegram redelivery of that SAME still-open request (same
+# request_date) must change nothing - the claim is still live and real.
+check("redelivery of the SAME request keeps the claim",
+      m.record_pending_request(CHAT, STALE_USER, request_date="2026-08-01T00:00:00+00:00"), False)
+check("...claim still on file", m.get_join_claim(CHAT, STALE_USER) is not None, True)
+
+# They come back with a genuinely NEW request (different request_date) - the
+# old one is over, but nothing ever cleared its state.
+check("a new request (different request_date) still asks for a fresh alert",
+      m.record_pending_request(CHAT, STALE_USER, request_date="2026-09-05T12:00:00+00:00"), True)
+check("5: the stale claim is gone - nobody has claimed THIS request",
+      m.get_join_claim(CHAT, STALE_USER), None)
+check("5: the stale admin-approval is gone - this request needs its own review",
+      m.was_admin_approved(CHAT, STALE_USER), False)
+check("5: the stale alert pointer is gone - a fresh one will be posted",
+      m.get_join_alerts(CHAT, STALE_USER), [])
+m.clear_pending_request(CHAT, STALE_USER)
+
+# Calling without a request_date at all (every caller except on_join_request)
+# must keep behaving exactly as before: never treated as a new cycle.
+m.record_pending_request(CHAT, STALE_USER)
+m.mark_request_alerted(CHAT, STALE_USER)
+m.record_join_claim(CHAT, STALE_USER, 111, "Elizabeth", STALE_NOTIFY, 1234)
+check("no request_date supplied -> never inferred as a new cycle",
+      m.record_pending_request(CHAT, STALE_USER), False)
+check("...claim untouched", m.get_join_claim(CHAT, STALE_USER) is not None, True)
+m.clear_pending_request(CHAT, STALE_USER)
+m.clear_join_claim(CHAT, STALE_USER)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)
