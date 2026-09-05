@@ -370,6 +370,7 @@ def db():
             alerted_at TEXT DEFAULT '',
             user_chat_id INTEGER DEFAULT 0,
             admin_approved_at TEXT DEFAULT '',
+            request_date TEXT DEFAULT '',
             PRIMARY KEY (chat_id, user_id)
         )"""
     )
@@ -438,6 +439,15 @@ def db():
         conn.execute("ALTER TABLE pending_requests ADD COLUMN user_chat_id INTEGER DEFAULT 0")
     if "admin_approved_at" not in pend_cols:
         conn.execute("ALTER TABLE pending_requests ADD COLUMN admin_approved_at TEXT DEFAULT ''")
+    # Telegram's own timestamp for the join request itself (req.date), distinct
+    # from requested_at above (which is when THIS PROCESS last saw it, and gets
+    # refreshed on every redelivery). Lets record_pending_request tell a genuine
+    # Telegram redelivery of a still-open request apart from a brand new request
+    # object issued after the previous one was resolved outside the two places
+    # that clean up claims/alerts (a native decline, a withdrawal, or expiry) -
+    # see record_pending_request's docstring.
+    if "request_date" not in pend_cols:
+        conn.execute("ALTER TABLE pending_requests ADD COLUMN request_date TEXT DEFAULT ''")
 
     # Migrate DBs created before the two questions were split apart. Anyone
     # mid-conversation under the old single-message flow had whatever they had
@@ -619,7 +629,7 @@ def build_message_link(chat, message_id):
     return None
 
 
-def record_pending_request(chat_id, user_id, user_chat_id=None):
+def record_pending_request(chat_id, user_id, user_chat_id=None, request_date=None):
     """Record (or refresh) a pending join request.
 
     Returns True when this request still needs an admin alert: either we have
@@ -631,34 +641,79 @@ def record_pending_request(chat_id, user_id, user_chat_id=None):
     same join request arrives again on the next boot. The old INSERT OR REPLACE
     said nothing about whether anyone had been told, so every restart posted a
     fresh copy of the alert into the admin group, each with its own live Claim
-    and Approve buttons. A member who withdraws a request and sends another one
-    took the same path.
+    and Approve buttons.
+
+    A member who withdraws a request and sends another one is NOT the same
+    case, even though it looks identical from here without request_date: the
+    old request already ended, just not through either of the two places that
+    clean up after one (arrival, or auto-approve - see clear_join_claim's call
+    sites). Its row in join_claims/join_alerts is stale, not live. request_date
+    is Telegram's own timestamp for the request object itself (req.date), so a
+    genuine redelivery carries the SAME value while a fresh request after a
+    withdrawal, a native decline, or expiry carries a new one - that is what
+    tells the two apart and triggers the stale-state wipe below. Passing None
+    (as every caller before on_join_request did) always takes the "same
+    request" branch, matching the old behaviour exactly.
     """
     now = datetime.now(timezone.utc).isoformat()
+    is_new_cycle = False
     with db() as conn:
         row = conn.execute(
-            "SELECT alerted_at FROM pending_requests WHERE chat_id=? AND user_id=?",
+            "SELECT alerted_at, request_date FROM pending_requests "
+            "WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
         ).fetchone()
         if row is None:
             conn.execute(
                 "INSERT INTO pending_requests "
-                "(chat_id, user_id, requested_at, alerted_at, user_chat_id) "
-                "VALUES (?,?,?,'',?)",
-                (chat_id, user_id, now, int(user_chat_id or 0)),
+                "(chat_id, user_id, requested_at, alerted_at, user_chat_id, "
+                "request_date) VALUES (?,?,?,'',?,?)",
+                (chat_id, user_id, now, int(user_chat_id or 0), request_date or ""),
             )
             return True
-        # Already on file. Keep alerted_at; only freshen when it was last seen.
-        conn.execute(
-            "UPDATE pending_requests SET requested_at=? WHERE chat_id=? AND user_id=?",
-            (now, chat_id, user_id),
-        )
+        alerted_at, prev_request_date = row
+        # A previous request for this exact person is still on file. Only
+        # request_date can tell a live redelivery from a superseding new
+        # request; without one to compare (every caller but on_join_request)
+        # always assume "same request", which is the old behaviour.
+        is_new_cycle = bool(request_date) and bool(prev_request_date) \
+            and request_date != prev_request_date
+        if is_new_cycle:
+            # Their last request ended some way this bot never got to clean
+            # up after (declined outside the bot, withdrawn, or expired) -
+            # start this one with a clean slate rather than inheriting a
+            # claim, an approval, or an alert that belongs to that one.
+            conn.execute(
+                "UPDATE pending_requests SET requested_at=?, alerted_at='', "
+                "admin_approved_at='', request_date=? "
+                "WHERE chat_id=? AND user_id=?",
+                (now, request_date, chat_id, user_id),
+            )
+        else:
+            # Already on file. Keep alerted_at; only freshen when it was last seen.
+            conn.execute(
+                "UPDATE pending_requests SET requested_at=? WHERE chat_id=? AND user_id=?",
+                (now, chat_id, user_id),
+            )
+            if request_date and not prev_request_date:
+                conn.execute(
+                    "UPDATE pending_requests SET request_date=? "
+                    "WHERE chat_id=? AND user_id=?",
+                    (request_date, chat_id, user_id),
+                )
         if user_chat_id:
             conn.execute(
                 "UPDATE pending_requests SET user_chat_id=? WHERE chat_id=? AND user_id=?",
                 (int(user_chat_id), chat_id, user_id),
             )
-    return not (row[0] or "")
+    if is_new_cycle:
+        # Outside the transaction above: each of these opens its own
+        # connection (db() does), same as everywhere else these two are
+        # called together (see clear_join_claim's call sites).
+        clear_join_claim(chat_id, user_id)
+        clear_join_alerts(chat_id, user_id)
+        return True
+    return not (alerted_at or "")
 
 
 def arrival_is_expected(chat_id, user_id) -> bool:
@@ -3685,8 +3740,11 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = req.chat
     remember_user(chat.id, user)
 
-    if not record_pending_request(chat.id, user.id,
-                                  user_chat_id=getattr(req, "user_chat_id", None)):
+    req_date = getattr(req, "date", None)
+    if not record_pending_request(
+            chat.id, user.id,
+            user_chat_id=getattr(req, "user_chat_id", None),
+            request_date=req_date.isoformat() if req_date else None):
         log.info("join request from user_id=%s in chat %s was already alerted - "
                  "not posting a second copy", user.id, chat.id)
         return
