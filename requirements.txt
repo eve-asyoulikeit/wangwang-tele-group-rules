@@ -1,0 +1,8 @@
+# Install into a virtualenv, not system-wide:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# [job-queue] pulls in APScheduler, needed for HEARTBEAT_HOURS and the
+# screening-debounce timer in main13.py (both degrade gracefully with a
+# warning if job_queue is unavailable, but this is what makes it available).
+python-telegram-bot[job-queue]>=21.0,<22
+python-dotenv>=1.0,<2
