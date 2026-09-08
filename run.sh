@@ -7,6 +7,13 @@
 
 cd "$(dirname "$0")" || exit 1
 
+# Prefer the project virtualenv's interpreter (pip install -r requirements.txt
+# into .venv) so this doesn't depend on whatever's installed system-wide, and
+# doesn't hit Debian/Raspberry Pi OS's PEP 668 externally-managed-environment
+# block. Falls back to plain python3 for anyone not using a venv.
+PYTHON="python3"
+[ -x ".venv/bin/python3" ] && PYTHON=".venv/bin/python3"
+
 # main13.py writes its own detailed log (LOG_FILE, default ~/bot.log).
 # This captures only launcher lines plus whatever main13.py prints to stdout,
 # which is now WARNING and above.
@@ -52,7 +59,7 @@ PENDING_EVERY="${PENDING_EVERY:-0}"
 watch_pending() {
     while true; do
         sleep "$PENDING_EVERY"
-        python3 - <<'PYEOF'
+        "$PYTHON" - <<'PYEOF'
 import os, sqlite3, datetime
 db  = os.environ.get("DB_PATH", "acceptances.db")
 ver = os.environ.get("TERMS_VERSION", "1")
@@ -104,7 +111,7 @@ while true; do
     echo "$(date -Is) starting main13.py" >> "$LOG"
     # tee so the terminal sees output too. PIPESTATUS, not $?, or the exit-1
     # backoff below reads tee's status instead and never triggers.
-    python3 main13.py 2>&1 | tee -a "$LOG"
+    "$PYTHON" main13.py 2>&1 | tee -a "$LOG"
     code=${PIPESTATUS[0]}
     echo "$(date -Is) main13.py exited with $code" >> "$LOG"
 
