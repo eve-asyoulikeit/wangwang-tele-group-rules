@@ -3419,26 +3419,37 @@ async def on_claim_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_join_claim(source_chat_id, user_id, admin.id, admin_name,
                        notify_chat_id, notify_message_id)
 
-    # Update the alert message to show who claimed it. Keep the Approve
-    # button live - claiming means "I'm questioning them", not "admit them".
-    # The two are independent actions and either admin (same one or another)
-    # still needs to tap Approve afterward.
+    # Update EVERY alert copy to show who claimed it, not just the one
+    # tapped. notify_admin_groups_of_join fans one alert out to every
+    # registered admin group (see join_alerts), so editing only query.message
+    # left the copies in every other admin group showing live Claim +
+    # Approve buttons with no visible sign the request had been claimed -
+    # tapping Claim there just got an "Already claimed" popup and nothing
+    # else changed. finalize_join_alerts and update_join_alerts_with_answer
+    # already loop over every copy; claiming was the one path that didn't.
+    # Keep the Approve button live on every copy - claiming means "I'm
+    # questioning them", not "admit them". The two are independent actions
+    # and either admin (same one or another) still needs to tap Approve
+    # afterward.
     if query.message:
-        try:
-            original_text = query.message.text_html or query.message.text or ""
-            updated = (
-                original_text
-                + f"\n\n🙋 <b>Claimed by {html.escape(admin_name)}</b>"
-            )
-            approve_only_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "✅ Approve",
-                    callback_data=f"{APPROVE_CB}:{source_chat_id}:{user_id}"),
-            ]])
-            await query.message.edit_text(
-                updated, parse_mode="HTML", reply_markup=approve_only_kb)
-        except TelegramError as e:
-            log.warning("Could not update claim message: %s", e)
+        original_text = query.message.text_html or query.message.text or ""
+        updated = (
+            original_text
+            + f"\n\n🙋 <b>Claimed by {html.escape(admin_name)}</b>"
+        )
+        approve_only_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✅ Approve",
+                callback_data=f"{APPROVE_CB}:{source_chat_id}:{user_id}"),
+        ]])
+        for alert_chat_id, alert_message_id in get_join_alerts(source_chat_id, user_id):
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=alert_chat_id, message_id=alert_message_id,
+                    text=updated, parse_mode="HTML", reply_markup=approve_only_kb)
+            except TelegramError as e:
+                log.warning("Could not update claim message in %s: %s",
+                            alert_chat_id, e)
 
     await safe_answer(query,
         f"Claimed! You're handling the DM for user {user_id}.",
