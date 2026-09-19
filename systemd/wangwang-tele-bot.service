@@ -1,0 +1,39 @@
+# systemd unit for the T&C gate bot, so it comes back up on its own after a
+# Raspberry Pi reboot or power loss instead of needing someone to SSH in and
+# run ./run.sh by hand.
+#
+# run.sh already retries main13.py if it crashes; this unit is the outer
+# layer that's missing without it - it's what starts run.sh in the first
+# place on boot, and restarts it if run.sh itself ever dies.
+#
+# Install on the Pi (edit User=/WorkingDirectory/ExecStart below first if
+# this repo doesn't live at /home/pi/wangwang-tele-group-rules or doesn't
+# run as user "pi"):
+#
+#   sudo cp systemd/wangwang-tele-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wangwang-tele-bot.service
+#
+# Check on it:
+#   systemctl status wangwang-tele-bot.service
+#   journalctl -u wangwang-tele-bot.service -f
+#
+# (main13.py's own log and run.sh's ~/bot-console.log still get written as
+# before - this just makes sure something starts them after a reboot.)
+
+[Unit]
+Description=Telegram T&C gate bot (wangwang-tele-group-rules)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/wangwang-tele-group-rules
+ExecStart=/bin/bash /home/pi/wangwang-tele-group-rules/run.sh
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
